@@ -26,6 +26,9 @@ from multiprocessing import Pool
 import re
 import subprocess
 
+from typing import List
+
+from MuRaL.data.segment_preprocessing import genoInfo_Generator
 
 def to_np(tensor):
     """Convert Tensor to numpy arrays"""
@@ -33,6 +36,71 @@ def to_np(tensor):
         return tensor.cpu().detach().numpy()
     else:
         return tensor.detach().numpy()
+
+def bed_reader_v0(bed_regions, central_bp):
+    """
+    Read a given BED region file and generate a new list of regions,
+    and split the regions into two lists based on their strand information.
+
+    Args:
+    - bed_regions: BedTool object or bed file path representing the BED region file to read.
+    - central_bp: Integer representing the length of the new regions to generate used encoding.
+
+    Yields:
+    Generator object that yields a list and a string:
+    - The list contains regions used encoding.
+    - The string represents the regions strand direction.
+    """
+    if isinstance(bed_regions, str):
+        bed_regions = BedTool(bed_regions)
+    else:
+        if not isinstance(bed_regions, BedTool):
+            print(f"Error: bed_regions should be <str> or <Bedtools>, but input is {bed_regions.__class__}!")
+            sys.exit()
+    init = 0
+    for region in bed_regions:
+        if not init:
+            init += 1
+            chrom, start0 = str(region.chrom), region.start
+            end0 = start0 + central_bp 
+            pos_strand_region = []
+            neg_strand_region = []
+            
+        chrom2, start, stop, strand = str(region.chrom), region.start, region.stop, region.strand
+            
+        if chrom2 != chrom:
+            if pos_strand_region:
+                yield pos_strand_region, '+'
+                pos_strand_region = []
+            if neg_strand_region:
+                yield neg_strand_region, '-'
+                neg_strand_region = []    
+            chrom = chrom2
+            start0 = 1
+            end0 = 1 + central_bp 
+                        
+        if strand == '+':
+            pos_strand_region.append(region)
+
+        else:
+            neg_strand_region.append(region)
+            
+        if start > end0:
+            if pos_strand_region:
+                yield pos_strand_region, '+'
+                pos_strand_region = []
+
+            if neg_strand_region:
+                yield neg_strand_region, '-'
+                neg_strand_region = []
+
+            start0 = end0
+            end0 += central_bp
+            
+    if pos_strand_region:
+        yield pos_strand_region, '+'
+    if neg_strand_region:
+        yield neg_strand_region, '-'
 
 def bed_reader(bed_regions, central_bp):
     """
@@ -76,13 +144,12 @@ def bed_reader(bed_regions, central_bp):
             start0 = 1
             end0 = 1 + central_bp 
             
-        if strand == '+':
-            pos_strand_region.append(region)
 
-        else:
-            neg_strand_region.append(region)
             
         if start > end0:
+            while start > end0:
+                start0 = end0
+                end0 += central_bp
             if pos_strand_region:
                 yield pos_strand_region, '+'
                 pos_strand_region = []
@@ -91,9 +158,13 @@ def bed_reader(bed_regions, central_bp):
                 yield neg_strand_region, '-'
                 neg_strand_region = []
 
-            start0 = end0
-            end0 += central_bp
-            
+
+        if strand == '+':
+            pos_strand_region.append(region)
+
+        else:
+            neg_strand_region.append(region)          
+
     if pos_strand_region:
         yield pos_strand_region, '+'
     if neg_strand_region:
@@ -178,6 +249,69 @@ def get_bw_for_bed(bw_files, bed_regions, radius):
         bw_data = np.array(bw_data).astype(np.float32)
     
     return bw_data
+
+def open_bigwig_files(bw_files):
+    return [pyBigWig.open(file) for file in bw_files]
+
+
+def get_bw_data(bw_fh, chrom, start, stop, strand, long_seq_len, bw_files_len, end):
+    # Initialize optional imputation arrays
+    annot_left_impute = None
+    annot_right_impute = None
+
+    # Handle left-side imputation if start is negative
+    if start < 0:
+        left_impute = -start
+        start = 0  # Adjust start to the beginning of the sequence
+        annot_left_impute = np.zeros((bw_files_len, left_impute))  # Left padding with zeros
+
+    # Handle right-side imputation if needed
+    if end:
+        right_impute = stop - long_seq_len
+        annot_right_impute = np.zeros((bw_files_len, right_impute))  # Right padding with zeros
+        stop = long_seq_len  # Adjust stop to the max sequence length
+
+    # Read BigWig data and replace NaNs with 0
+    bw_data = np.asarray([np.nan_to_num(bw.values(chrom, start, stop, numpy=True)) for bw in bw_fh])
+
+    # Concatenate left-side imputation if applicable
+    if annot_left_impute is not None:
+        bw_data = np.concatenate([annot_left_impute, bw_data], axis=1)
+
+    # Concatenate right-side imputation if applicable
+    if annot_right_impute is not None:
+        bw_data = np.concatenate([bw_data, annot_right_impute], axis=1)
+
+    return bw_data
+
+def segment_annot(long_seq_len, bw_fh, start, stop, chrom, strand, end=False):
+    bw_data = get_bw_data(bw_fh, chrom, start, stop, strand, long_seq_len, len(bw_fh), end)
+    return bw_data
+
+def batch_annot_by_segment(bw_data, index, radius):
+    window_size = 2 * radius + 1  
+    return np.asarray([bw_data[:, start1: start1 + window_size] for start1 in index], dtype=float)
+
+def annot_encoding_by_region(bw_fh, seqs, batch_shape, radius, seq_records):
+    if not hasattr(seqs, '__iter__'):
+        sys.exit("Error: input seqs is not <generator>!")
+    
+    batch_annot_encoding = np.empty((batch_shape, len(bw_fh), 2 * radius + 1), dtype='float32')
+    batch_index = 0
+    long_seq_len = None
+    
+    for start0, stop0, chrom, strand, index, end in seqs:
+        if long_seq_len is None:
+            long_seq_len = len(str(seq_records[chrom].seq))
+        
+        bw_data = segment_annot(long_seq_len, bw_fh, start0, stop0, chrom, strand, end)
+        annot_seq = batch_annot_by_segment(bw_data, index, radius)
+
+        sub_batch_num = len(index)
+        batch_annot_encoding[batch_index:batch_index + sub_batch_num] = annot_seq
+        batch_index += sub_batch_num
+    
+    return batch_annot_encoding
 #########################################################################
 #                          gene HD5
 #  use HD5 for saving distal Encoding(One-Hot)
@@ -348,7 +482,7 @@ def check_h5f_sample_size(h5f):
 #########################################################################
 #                           Local Embeding 
 #########################################################################
-def prepare_local_data(bed_regions, ref_genome, bw_files, bw_names, bw_radii, central_radius, local_radius, local_order, seq_only):
+def prepare_local_data(bed_regions, ref_genome, bw_files, bw_names, bw_radii, central_bp, local_radius, local_order, seq_only):
     """Prepare local data for given regions"""
     """  
         Args:
@@ -356,14 +490,14 @@ def prepare_local_data(bed_regions, ref_genome, bw_files, bw_names, bw_radii, ce
             ref_genome:  <SeqRecord> ref genome
     """
     # Read the seq data
-    local_seq_cat,y = local_digitalized_seqs_by_region(bed_regions, ref_genome, central_radius, local_radius, local_order=1)    
+    local_seq_cat, y = local_digitalized_seqs_by_region(bed_regions, ref_genome, central_bp=central_bp, local_radius=local_radius, local_order=1)    
     #local_seq_cat = pd.concat([pd.DataFrame(x,columns = seq_cols) for x in local_seq_cat],keys=range(len(local_seq_cat)))
     local_seq_cat = pd.concat(local_seq_cat,keys=range(len(local_seq_cat)))
 
     seq_cols = ['us'+str(local_radius - i) for i in range(local_radius)] + ['mid'] + ['ds'+str(i+1) for i in range(local_radius)]
     local_seq_cat = pd.DataFrame(local_seq_cat, columns = seq_cols)
     if local_order > 1:
-        local_seq_cat2,y = local_digitalized_seqs_by_region(bed_regions, ref_genome, central_radius, local_radius, local_order=local_order)
+        local_seq_cat2, y = local_digitalized_seqs_by_region(bed_regions, ref_genome, central_bp, local_radius, local_order=local_order)
         
         # NOTE: replace k-mers with 'N' with a large number; the padding numbers at the two ends of the chromosomes are also large numbers   
         #local_seq_cat2 = np.where(np.logical_and(local_seq_cat2>=0, local_seq_cat2<=4**local_order), local_seq_cat2, 4**local_order)
@@ -384,7 +518,10 @@ def prepare_local_data(bed_regions, ref_genome, bw_files, bw_names, bw_radii, ce
     output_feature = 'mut_type'
     
     # Add feature data in bigWig files
+    # bug seq_only = false , concat multi Index dataframe and Index dataframe
+    seq_only = True
     if len(bw_files) > 0 and seq_only == False:
+        get_local_bw_data_by_region(bw_files, bw_names, bw_radii, bed_regions, central_bp=central_bp)
         # Use the mean value of the region of 2*radius+1 bp around the focal site
         bw_data = get_mean_bw_for_bed(bw_files, bw_names, bw_radii, bed_regions)
         data_local = pd.concat([local_seq_cat2, bw_data, y], axis=1)
@@ -392,6 +529,102 @@ def prepare_local_data(bed_regions, ref_genome, bw_files, bw_names, bw_radii, ce
         data_local = pd.concat([local_seq_cat2, y], axis=1)
 
     return data_local, seq_cols, categorical_features, output_feature
+
+def prepare_local_datav2(bed_regions,ref_genome, bw_files, bw_names, bw_radii, central_bp, local_radius, local_order, seq_only):
+
+    bed_generator = bed_reader(bed_regions, central_bp)
+    seqs_information_generator = seq_generator(bed_generator, ref_records=ref_genome, local_radius=local_radius)
+    y = []
+    local_seq_cat = []
+    local_seq_cat2 = []
+
+    bw_data = []
+    # Check if bigWig data should be used
+    use_bigwig = len(bw_files) > 0 and not seq_only
+
+    for long_seq, seqs, label in seqs_information_generator:
+        sample_number = len(label)
+        local_seq_cat_by_region = kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius=local_radius, local_order=1)
+        local_seq_cat.append(local_seq_cat_by_region)
+        
+        if local_order > 1:
+            local_seq_cat_by_region = kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius=local_radius, local_order=local_order)
+            local_seq_cat2.append(local_seq_cat_by_region)
+        if use_bigwig:
+            bw_data_by_region = get_local_bw_data_by_region(bw_files=bw_files, bw_radii=bw_radii, bw_names=bw_names,sample_number=sample_number, seqs=seqs)
+            bw_data.append(bw_data_by_region)
+
+        y.append(pd.DataFrame(label.reshape((-1,1)),columns = ['mut_type']))
+    
+    if local_seq_cat:
+        local_seq_cat = pd.concat(local_seq_cat, keys=range(len(local_seq_cat)))
+        seq_cols = ['us'+str(local_radius - i) for i in range(local_radius)] + ['mid'] + ['ds'+str(i+1) for i in range(local_radius)]
+    else:
+        raise ValueError("local_seq_cat is empty. Ensure that sequences are being generated correctly.")
+
+    if local_seq_cat2:
+        cat_n = local_radius*2 +1 - (local_order-1)
+        categorical_features  = ['cat'+str(i+1) for i in range(cat_n)]
+
+        local_seq_cat2 = pd.concat(local_seq_cat2, keys=range(len(local_seq_cat2)))
+        local_seq_cat2 = pd.concat([local_seq_cat, local_seq_cat2], axis=1)
+    else:
+        categorical_features = seq_cols
+
+    print('local_seq_cat2 shape and columns:', local_seq_cat2.shape, local_seq_cat2.columns)
+    print('categorical_features:', categorical_features)
+
+    y = pd.concat(y, keys=range(len(y)))
+    output_feature = 'mut_type'
+
+    # Add feature data in bigWig files
+    # bug seq_only = false , concat multi Index dataframe and Index dataframe
+    if bw_data:
+        bw_data = pd.concat(bw_data, keys=range(len(bw_data)))
+        # Use the mean value of the region of 2*radius+1 bp around the focal site
+        data_local = pd.concat([local_seq_cat2, bw_data, y], axis=1)
+    else:
+        data_local = pd.concat([local_seq_cat2, y], axis=1)
+
+    return data_local, seq_cols, categorical_features, output_feature
+
+
+
+def kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius, local_order):
+    """Region as the minimum unit"""
+    cat_n = local_radius*2 +1 - (local_order-1) 
+    outlier_process = preocess_local_seq_outlier(local_order, local_radius)
+
+    if local_order == 1:
+        seq_cols = ['us'+str(local_radius - i) for i in range(local_radius)] + ['mid'] + ['ds'+str(i+1) for i in range(local_radius)]
+    else:
+        seq_cols  = ['cat'+str(i+1) for i in range(cat_n)]
+
+    kmer_encoding_seqs = np.empty((sample_number, cat_n),dtype=np.int64)
+
+    kmer_encoding_seqs = local_encoding_seqs(long_seq, seqs, local_radius, kmer_encoding_seqs, local_order=local_order)
+    kmer_encoding_seqs = outlier_process(kmer_encoding_seqs)
+    kmer_encoding_seqs = pd.DataFrame(kmer_encoding_seqs,columns=seq_cols)
+
+    return kmer_encoding_seqs
+
+
+def seq_generator(bed_generator, ref_records, local_radius):
+    init = False
+    for batch, stand in bed_generator:
+        if not init:
+            chrom = batch[0].chrom
+            long_seq = str(ref_records[chrom].seq)
+            init = True
+        else:
+            if chrom != batch[0].chrom:
+                chrom = batch[0].chrom
+                long_seq = str(ref_records[chrom].seq)
+        
+        seqs = list(get_seqs_to_digitalized(long_seq, batch, local_radius, stand))
+        label = get_label(batch)
+        yield long_seq, seqs, label
+
 
 def local_digitalized_seqs_by_region(bed_regions, seq_records, central_bp, local_radius, local_order=1):
 
@@ -599,11 +832,49 @@ def seq_digit_encoder(long_seq, start, stop, chrom, strand, radius, index, local
     digit_seq = np.where(np.logical_and(digit_seq>=0, digit_seq<=4**local_order), digit_seq, 4**local_order)
     return digit_seq
 
-def get_mean_bw_for_bed(bw_files, bw_names, bw_radii, bed_regions):
+def get_local_bw_data_by_region(bw_files:List[str],
+                                bw_radii, 
+                                bw_names,
+                                sample_number,
+                                seqs):
+    bw_fh = [pyBigWig.open(file) for file in bw_files]
+    batch_bw_data = np.zeros((sample_number, len(bw_fh)),dtype=float)
+    batch_bw_data = get_mean_bw_seqs(bw_fh, seqs, bw_radii, batch_bw_data)
+    batch_bw_data = pd.DataFrame(batch_bw_data, columns=bw_names)
+    return batch_bw_data
 
-    bw_fh = []
-    for file in bw_files:
-        bw_fh.append(pyBigWig.open(file))
+
+def get_mean_bw_seqs(bw_fh, seqs, bw_radii, batch_bw_data):
+
+    batch_index = 0
+    for start, stop, chrom, strand, index, end in seqs:
+        sub_batch_num = len(index)
+        sub_batch = get_mean_bw_base_each_pointend(bw_fh, start, stop, chrom, index, bw_radii)
+        batch_bw_data[batch_index:batch_index+sub_batch_num] = sub_batch
+        batch_index += sub_batch_num
+    
+    return batch_bw_data 
+
+
+def get_mean_bw_base_each_pointend(bw_fh, start, stop, chrom, index, bw_radii):
+    mean_bw_seq = []
+    for i, bw in enumerate(bw_fh):
+        window_size = bw_radii[i] * 2 + 1
+        each_bw_seq = np.nan_to_num(bw.values(chrom, start, stop))
+        each_mean_bw_seq = np.asarray([
+            np.mean(each_bw_seq[start: min(start+window_size, len(each_bw_seq))]) 
+            for start in index
+        ], dtype=np.float)
+        mean_bw_seq.append(each_mean_bw_seq)
+    # shape: (bw_name, sample)
+    mean_bw_seq = np.asarray(mean_bw_seq)
+    # reshape: (sample, bw_name)
+    mean_bw_seq = mean_bw_seq.T
+
+    return mean_bw_seq
+
+
+def get_mean_bw_for_bed(bw_fh, bw_radii, bed_regions):
     
     bw_data = np.zeros((len(bed_regions), len(bw_fh)), dtype=float)
     
@@ -638,7 +909,35 @@ def get_label(bed_regions):
 # Suggestion: For human data, if the distal region is greater than 8k,
 #             it is recommended to use this method.
 #########################################################################
-def prepare_dataset_np(bed_regions, ref_genome, bw_files, bw_names, bw_radii,central_radius=30000, local_radius=5, local_order=1, distal_radius=50, distal_order=1, seq_only=False, without_bw_distal=False):
+def max_min_norm(data):
+    data = np.asarray(data)
+    v_max, v_min = np.max(data), np.min(data)
+    return (data - v_min) / (v_max - v_min)
+
+def prepare_soft_label(bed_regions, segment_center, distal_radius):
+    soft_label_dict = {
+        'segment_avg_mut': [],
+        'segment_id' : []
+    }
+
+    segment_generator = bed_reader(bed_regions, segment_center)
+    segment_info_geno = genoInfo_Generator(segment_center, distal_radius)
+
+    # get soft label
+    for segment in segment_generator:
+        freq_segment, segment_idx = segment_info_geno.get_infor(segment)
+        soft_label_dict['segment_id'].append(segment_idx)
+        soft_label_dict['segment_avg_mut'].append(freq_segment)
+
+    # preprocessing soft label
+    soft_label_dict['segment_avg_mut'] = np.asarray(soft_label_dict['segment_avg_mut'])
+    soft_label_dict['segment_id'] = max_min_norm(soft_label_dict['segment_id'])
+
+    return soft_label_dict
+
+
+
+def prepare_dataset_np(bed_regions, ref_genome, bw_files, bw_names, bw_radii,central_radius=30000, local_radius=5, local_order=1, distal_radius=50, distal_order=1, seq_only=False, without_bw_distal=False, segment_task=None):
     """Prepare the datasets for given regions, without an H5 file"""
     """  
         Args:
@@ -647,7 +946,7 @@ def prepare_dataset_np(bed_regions, ref_genome, bw_files, bw_names, bw_radii,cen
     """
     # Prepare local data
     ref_genome = SeqIO.to_dict(SeqIO.parse(open(ref_genome, 'r'), 'fasta'))
-    data_local, seq_cols, categorical_features, output_feature = prepare_local_data(bed_regions, ref_genome, bw_files, bw_names, bw_radii, central_radius, local_radius, local_order, seq_only)
+    data_local, seq_cols, categorical_features, output_feature = prepare_local_datav2(bed_regions, ref_genome, bw_files, bw_names, bw_radii, central_radius, local_radius, local_order, seq_only)
 
     # If seq_only flag was set, bigWig files will be ignored
     if seq_only or without_bw_distal:
@@ -660,11 +959,23 @@ def prepare_dataset_np(bed_regions, ref_genome, bw_files, bw_names, bw_radii,cen
     dataset = CombinedDatasetNP(data=data_local, seq_cols=seq_cols, cat_cols=categorical_features, output_col=output_feature, ref_genome=ref_genome, bed_regions=bed_regions, central_radius=central_radius, distal_radius=distal_radius, n_channels=n_channels, bw_files=bw_files, seq_only=seq_only, without_bw_distal=without_bw_distal)
     return dataset
 
+
+
 class CombinedDatasetNP(Dataset):
     """Combine local data and distal into Dataset, using NumPy funcions"""
-    def __init__(self, data, seq_cols, cat_cols, output_col, \
-                 ref_genome, bed_regions, central_radius, distal_radius, \
-                 n_channels, bw_files, seq_only, without_bw_distal):
+    def __init__(self, data, 
+                 seq_cols, 
+                 cat_cols, 
+                 output_col,
+                 ref_genome, 
+                 bed_regions, 
+                 central_radius, 
+                 distal_radius,
+                 n_channels, 
+                 bw_files, 
+                 seq_only, 
+                 without_bw_distal,
+                 segment_task=None):
         """  
         Args:
             data: DataFrame containing local seq data and categorical data
@@ -690,7 +1001,7 @@ class CombinedDatasetNP(Dataset):
         self.n = data.index[-1][0] + 1# batch number
         # Output column
         if output_col:
-             self.y = data[output_col].astype(np.float32)
+            self.y = data[output_col].astype(np.float32)
             #self.y = data[output_col].astype(np.float32).values.reshape(-1, 1)
         else:
             sys.exit(f"Error: {output_col}")
@@ -707,7 +1018,7 @@ class CombinedDatasetNP(Dataset):
         
         # Assign the continuous data to cont_X
         if self.cont_cols:
-            self.cont_X = data[self.cont_cols].astype(np.float32).values
+            self.cont_X = data[self.cont_cols].astype(np.float32)
         else:
             self.cont_X = np.zeros((self.n, 1)) 
         
@@ -725,13 +1036,13 @@ class CombinedDatasetNP(Dataset):
         self.n_channels = n_channels
         self.bw_files = bw_files
         
+        self.without_bw_distal = without_bw_distal
         ####
         self.bw_fh = []
         for file in self.bw_files:
             self.bw_fh.append(pyBigWig.open(file))
         ####
         self.seq_only = seq_only
-        self.without_bw_distal = without_bw_distal
         print('Number of channels to be used for distal data:', self.n_channels)
         
         self.distal_radius = distal_radius
@@ -742,6 +1053,7 @@ class CombinedDatasetNP(Dataset):
         self.records = ref_genome
 
         self.distal_info = False
+        self.segment_task = segment_task
     def __len__(self):
         """ Denote the total number of samples. """
         return self.n
@@ -749,11 +1061,19 @@ class CombinedDatasetNP(Dataset):
     def __getitem__(self, index):
         """ Generate one batch of data. """
         assert index < self.n
-        seqs = iter(self.seqs_list[index])
+        seqs = self.seqs_list[index]
         batch_distal = distal_encoding_by_region(seqs, self.batch_shape[index], self.distal_radius,self.records)
-        #assert np.sum(self.y.loc[index] == label) == len(label)
+        if self.bw_fh:
+            if not self.without_bw_distal:
+                batch_annot_encoding = annot_encoding_by_region(self.bw_fh, seqs, self.batch_shape[index], self.distal_radius, self.records)
+                batch_distal = np.concatenate([batch_distal, batch_annot_encoding], axis=1)
+            return self.y.loc[index].values.reshape(-1, 1), self.cont_X.loc[index].values, self.cat_X.loc[index].values, batch_distal
         
-        return self.y.loc[index].values.reshape(-1, 1), self.cont_X[index], self.cat_X.loc[index].values, batch_distal
+       # return self.y.loc[index].values.reshape(-1, 1), self.cont_X[index], self.cat_X.loc[index].values, batch_distal
+        if self.segment_task is not None:
+            return self.y.loc[index].values.reshape(-1, 1), self.cat_X.loc[index].values, batch_distal
+        
+        return self.y.loc[index].values.reshape(-1, 1), self.cat_X.loc[index].values, batch_distal
 
     def get_distal_encoding_infomation(self):
         self.seqs_list,self.batch_shape = get_distal_seqs_by_region(self.bed_regions, self.records, self.distal_radius, self.central_radius)
@@ -791,8 +1111,8 @@ def get_distal_seqs_by_region(bed_regions, seq_records, radius, central_bp):
     return seqs_list,batch_shape
 
 def distal_encoding_by_region(seqs, batch_shape, radius,seq_records):
-    if '__iter__' not in dir(seqs):
-        sys.exit("Error : input seqs is not <generator>!")
+    #if '__iter__' not in dir(seqs):
+     #   sys.exit("Error : input seqs is not <generator>!")
         
     # Create an array to store batch after ohe encoding
     batch_ohe_encoding = np.empty((batch_shape,4,2*radius + 1), dtype='float32')
@@ -1012,15 +1332,15 @@ def get_sample_from_segment(distal_seq, sub_index, stand,radius):
 #########################################################################
 #                          Construct DataLoader 
 #########################################################################
-def generate_data_batches(segmentLoader_train, batch_segment, batch_size, shuffle=True, sample_workers=0):
-    iter_seg_share_dataset = get_seg_share_dataset(segmentLoader_train, batch_segment)
+def generate_data_batches(segmentLoader_train, batch_segment, batch_size, shuffle=True, sample_workers=0, use_segment_task=False):
+    iter_seg_share_dataset = get_seg_share_dataset(segmentLoader_train, batch_segment, use_segment_task)
     # init
     seg_dataset = next(iter_seg_share_dataset)
     
-    merge = False
     drop_last = False
     # gene batch to train
     while True:
+        merge = False
         dataloader = DataLoader(seg_dataset, batch_size, shuffle=shuffle, num_workers=sample_workers, pin_memory=False)
         for y, cont_x, cat_x, distal_x in dataloader:
             # if sample less than batch number, merge to next segment
@@ -1040,10 +1360,14 @@ def generate_data_batches(segmentLoader_train, batch_segment, batch_size, shuffl
                 
         # if merge, merge to next segment
         if merge:
-            merge = False
             seg_dataset.merge(y, cont_x, cat_x, distal_x)
 
-def get_seg_share_dataset(segmentLoader, batch_segment):
+def get_seg_share_dataset(segmentLoader, batch_segment, use_segment_task):
+    if use_segment_task:
+        DatasetLoader = Create_DatasetSegment_Adaptive
+    else:
+        DatasetLoader = Create_DatasetSegment
+
     count = 0
     segment_saver = []
     for segment in segmentLoader:
@@ -1051,43 +1375,290 @@ def get_seg_share_dataset(segmentLoader, batch_segment):
         count += 1
     
         if count >= batch_segment:
-            segment_dataset = Create_DatasetSegment(segment_saver)
+            segment_dataset = DatasetLoader(segment_saver)
             yield segment_dataset
             count = 0
             segment_saver = []
 
     if segment_saver:
-        segment_dataset = Create_DatasetSegment(segment_saver)
+        segment_dataset = DatasetLoader(segment_saver)
         yield segment_dataset
 
-class Create_DatasetSegment(Dataset):
-    """     """
-    def __init__(self, data_batch):
-        """  
-        Args:
+
+def generate_data_batches_v2(datasetLoader, batch_segment, batch_size, shuffle=True, sample_workers=0):
+    dataloader_multi_segments = MultiSegmentDatasetIterator(datasetLoader, batch_segment, batch_size)
+    
+    drop_last = False
+    # gene batch to train
+    for dataset_multi_segments in dataloader_multi_segments:
+        merge = False
+        dataloader = DataLoader(dataset_multi_segments, batch_size, shuffle=shuffle, num_workers=sample_workers, pin_memory=False)
+        for segment_samples in dataloader:
+            sample_number = segment_samples[0].shape[0]
+            # if sample less than batch number, merge to next segment
+            if sample_number < batch_size:
+                merge = True
+                break
+
+            yield segment_samples
+        # check end and read next segment
+        try:
+            dataset_multi_segments = next(dataloader_multi_segments)
+        except StopIteration:
+            # merge=True, indicate last batch not output. 
+            if merge and not drop_last:
+                yield segment_samples
+            return
+                
+        # if merge, merge to next segment
+        if merge:
+            dataset_multi_segments.merge_batch(segment_samples)
+
+class MultiSegmentDatasetIterator:
+    def __init__(self, segment_dataset_loader, segment_number, batch_size):
+        self.segment_dataset_loader = iter(segment_dataset_loader)
+        self.segment_nember = segment_number
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        count = 0
+        dataset_multi_segment = None
+        while count < self.batch_size:
+            try:
+                dataset_segment = next(self.segment_dataset_loader)
+                if dataset_multi_segment is None:
+                    dataset_multi_segment = dataset_segment
+                else:
+                    dataset_multi_segment.merge_dataset(dataset_segment)
+                count += 1
+            except StopIteration:
+                if dataset_multi_segment is not None:
+                    # 返回最后一个不足 batch_size 的批次
+                    return_value = dataset_multi_segment
+                    dataset_multi_segment = None
+                    return return_value
+                else:
+                    raise StopIteration
+        return_value = dataset_multi_segment
+        dataset_multi_segment = None
+        return return_value
+
+
+# class Create_DatasetSegment(Dataset):
+#     """     """
+#     def __init__(self, data_batch):
+#         """  
+#         Args:
           
+#         """
+        
+#         self.y = torch.cat([batch[0].squeeze(0) for batch in data_batch])
+#         self.cat_X = torch.cat([batch[2].squeeze(0) for batch in data_batch])
+#         self.distal_x = torch.cat([batch[3].squeeze(0) for batch in data_batch])
+        
+#         self.n = self.y.shape[0]
+#         self.cont_X = np.zeros((self.n, 1))  
+#     def __len__(self):
+#         """ Denote the total number of samples. """
+#         return self.n
+
+#     def __getitem__(self, index):
+#         """ Generate one batch of data. """
+        
+#         return self.y[index], self.cont_X[0], self.cat_X[index], self.distal_x[index]
+    
+#     def merge(self, y, cont_x, cat_x, distal_x):
+#         """ Add one batch of data"""
+#         self.y = torch.cat([y, self.y])
+#         self.cat_X = torch.cat([cat_x, self.cat_X])
+#         self.distal_x = torch.cat([distal_x, self.distal_x])
+
+#         self.n = self.y.shape[0]
+
+class Create_DatasetSegment(Dataset):
+    """
+    Dataset class for handling segmented data batches.
+    """
+    
+    def __init__(self, data_batch):
         """
-        
-        self.y = torch.cat([batch[0].squeeze(0) for batch in data_batch])
-        self.cat_X = torch.cat([batch[2].squeeze(0) for batch in data_batch])
-        self.distal_x = torch.cat([batch[3].squeeze(0) for batch in data_batch])
-        
+        Initialize the dataset with a batch of data.
+
+        Args:
+            data_batch (list of tensors): List of batched data where each element
+                                          contains (y, cont_X, cat_X, distal_X).
+                                          If data_batch contains 4 elements, cont_X is included;
+                                          otherwise, cont_X will be initialized with zeros.
+        """
+        if len(data_batch[0]) == 4:
+            self.y, self.cont_X, self.cat_X, self.distal_x = self._unpack_batch(data_batch)
+        else:
+            self.y, self.cat_X, self.distal_x = self._unpack_batch(data_batch, with_cont_X=False)
+            self.cont_X = torch.zeros_like(self.y)  # Initialize cont_X with zeros if not provided
+
         self.n = self.y.shape[0]
-        self.cont_X = np.zeros((self.n, 1))  
+    
     def __len__(self):
-        """ Denote the total number of samples. """
+        """
+        Return the total number of samples in the dataset.
+        """
         return self.n
 
     def __getitem__(self, index):
-        """ Generate one batch of data. """
-        
+        """
+        Retrieve a sample by index.
+
+        Args:
+            index (int): Index of the sample to retrieve.
+
+        Returns:
+            tuple: A tuple containing (y, cont_X, cat_X, distal_x) for the given index.
+        """
         return self.y[index], self.cont_X[index], self.cat_X[index], self.distal_x[index]
     
     def merge(self, y, cont_x, cat_x, distal_x):
-        """ Add one batch of data"""
+        """
+        Merge a new batch of data into the existing dataset.
+
+        Args:
+            y (tensor): Target labels for the new batch.
+            cont_x (tensor): Continuous features for the new batch.
+            cat_x (tensor): Categorical features for the new batch.
+            distal_x (tensor): Distal features for the new batch.
+        """
         self.y = torch.cat([y, self.y])
+        self.cont_X = torch.cat([cont_x, self.cont_X])
         self.cat_X = torch.cat([cat_x, self.cat_X])
         self.distal_x = torch.cat([distal_x, self.distal_x])
 
         self.n = self.y.shape[0]
-        self.cont_X = np.zeros((self.n, 1)) 
+
+    def _unpack_batch(self, data_batch, with_cont_X=True):
+        """
+        Helper function to unpack a data batch into individual components.
+
+        Args:
+            data_batch (list): List of batch tensors.
+            with_cont_X (bool): Whether the batch includes continuous features.
+
+        Returns:
+            tuple: Unpacked batch elements (y, cont_X, cat_X, distal_x).
+        """
+        if with_cont_X:
+            y = torch.cat([batch[0].squeeze(0) for batch in data_batch])
+            cont_X = torch.cat([batch[1].squeeze(0) for batch in data_batch])
+            cat_X = torch.cat([batch[2].squeeze(0) for batch in data_batch])
+            distal_x = torch.cat([batch[3].squeeze(0) for batch in data_batch])
+            return y, cont_X, cat_X, distal_x
+        else:
+            y = torch.cat([batch[0].squeeze(0) for batch in data_batch])
+            cat_X = torch.cat([batch[1].squeeze(0) for batch in data_batch])
+            distal_x = torch.cat([batch[2].squeeze(0) for batch in data_batch])
+            return y, cat_X, distal_x
+
+
+
+class Create_DatasetSegment_Adaptive(Dataset):
+    """
+    Dataset class for handling segmented data batches.
+    """
+    
+    def __init__(self, data_batch):
+        """
+        Initialize the dataset with a batch of data.
+
+        Args:
+            data_batch (list of tensors): List of batched data where each element
+                                          contains (y, *features).
+                                          Features can vary in number.
+        """
+        self.y = self._unpack_batch(data_batch, index=0)
+        self.features = [self._unpack_batch(data_batch, index=i) for i in range(1, len(data_batch[0]))]
+        
+        self.n = self.y.shape[0]
+    
+    def __len__(self):
+        """
+        Return the total number of samples in the dataset.
+        """
+        return self.n
+
+    def __getitem__(self, index):
+        """
+        Retrieve a sample by index.
+
+        Args:
+            index (int): Index of the sample to retrieve.
+
+        Returns:
+            tuple: A tuple containing (y, *features) for the given index.
+        """
+        return (self.y[index],) + tuple(feature[index] for feature in self.features)
+    
+    def merge(self, *new_data_batches):
+        """
+        Merge new batches of data into the existing dataset.
+
+        Args:
+            *new_data_batches: New batches of data to merge.
+        """
+        for i, new_data in enumerate(new_data_batches):
+            new_tensor = self._unpack_batch(new_data, index=0)
+            self.y = torch.cat([self.y, new_tensor])
+            if i < len(self.features):
+                self.features[i] = torch.cat([self.features[i], self._unpack_batch(new_data, index=i+1)])
+            else:
+                self.features.append(self._unpack_batch(new_data, index=i+1))
+
+        self.n = self.y.shape[0]
+
+    def _unpack_batch(self, data_batch, index):
+        """
+        Helper function to unpack a data batch into individual components.
+
+        Args:
+            data_batch (list): List of batch tensors.
+            index (int): The index of the component to unpack.
+
+        Returns:
+            tensor: Unpacked component for the given index.
+        """
+        ndim = data_batch[0][index].ndim
+        if ndim == 1:
+            return torch.cat([batch[index] for batch in data_batch])
+
+        return torch.cat([batch[index].squeeze(0) for batch in data_batch])
+
+
+######################
+# DataLoader by segment
+# - yield data(batch) by segment
+# - sample numbers between batchs are different 
+# - sample numbers is dependend on SNP density
+####################
+
+def generate_data_batches_filt(dataset, 
+                          batch_segment: int=1, 
+                          cutoff_batch_size: int=128, 
+                          shuffle: bool=True, 
+                          num_workers: int=0):
+    
+    dataloader = DataLoader(dataset, batch_segment, shuffle=shuffle, num_workers=num_workers, pin_memory=False)
+    batch_number = 0
+    train_number = 0
+    for y, cont_x, cat_x, distal_x in dataloader:
+        batch_number += 1
+        y = y.squeeze(0)
+        cont_x = cont_x.squeeze(0)
+        cat_x = cat_x.squeeze(0)
+        distal_x = distal_x.squeeze(0)
+            # if sample less than batch number, merge to next segment
+        if y.shape[0] < cutoff_batch_size:
+            continue
+
+        train_number += 1
+        yield y, cont_x, cat_x, distal_x
+    print(f"total {batch_number} segment, drop {batch_number-train_number} segment")

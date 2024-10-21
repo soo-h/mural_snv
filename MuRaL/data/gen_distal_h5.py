@@ -22,7 +22,7 @@ import datetime
 
 #from MuRaL.nn_models import *
 #from MuRaL.nn_utils import *
-from MuRaL.preprocessing import *
+from MuRaL.data.preprocessing import *
 #from MuRaL.evaluation import *
 from MuRaL._version import __version__
 

@@ -36,14 +36,18 @@ import time
 import datetime
 import random
 
-from MuRaL.printer_utils import get_printer
-from MuRaL.nn_models import *
-from MuRaL.nn_utils import *
-from MuRaL.preprocessing import *
-from MuRaL.evaluation import *
-from MuRaL.train_utils import run_train
-from MuRaL.training import train
+from MuRaL.utils.printer_utils import get_printer
+from MuRaL.utils.gpu_utils import get_available_gpu, check_cuda_id
+from MuRaL.models.nn_models import *
+from MuRaL.models.nn_utils import *
+from MuRaL.data.preprocessing import *
+from MuRaL.evaluation.evaluation import *
+from MuRaL.utils.train_utils import run_train
 from MuRaL._version import __version__
+
+from MuRaL.scripts.training_accumulation import train_grad_accumu
+from MuRaL.scripts.trainingBysegment import trainBySegment
+from MuRaL.scripts.trainingv2 import train
 
 import textwrap
 #from torch.utils.tensorboard import SummaryWriter
@@ -118,6 +122,11 @@ def parse_arguments(parser):
                           please first consider increasing --cpu_per_trial, this is a more effect way 
                           to accelerate training process by speeding up data loading. 
                            Default: False.""").strip())
+
+    data_args.add_argument('--grad_accumu', default=False, action='store_true', 
+                          help=textwrap.dedent("""
+                          grad accumulation, 10 batchs computation grad once
+                           Default: False.""").strip())
     
     data_args.add_argument('--h5f_path', type=str, default=None,
                           help=textwrap.dedent("""
@@ -146,6 +155,23 @@ def parse_arguments(parser):
                               features in BigWig tracks.
                           Default: 2.
                           """ ).strip())
+
+    model_args.add_argument('--use_segment_task', 
+                            default=False,
+                            action = 'store_true',
+                            help=textwrap.dedent("""
+                            Use segment Information as aux task.
+                            """).strip())
+                            
+    
+
+    model_args.add_argument('--calc_loss_strategy_name', type=str, default=None)
+
+    model_args.add_argument('--use_dilation', 
+                            default=False, 
+                            action='store_true',  
+                            help=textwrap.dedent("""Add this parameter if dilation is used in the model.""" ))
+
     model_args.add_argument('--n_class', type=int, metavar='INT', default='4',  
                           help=textwrap.dedent("""
                           Number of mutation classes (or types), including the 
@@ -226,6 +252,10 @@ def parse_arguments(parser):
                           Size of mini batches for model training. Default: 128.
                           """ ).strip())
     
+    learn_args.add_argument('--segment_dataloader', default=False, action='store_true',  
+                          help=textwrap.dedent("""
+                          """ ).strip())
+
     learn_args.add_argument('--custom_dataloader', default=False, action='store_true',  
                           help=textwrap.dedent("""
                           Use a custom data loader. This data loader is not supported parallelizing
@@ -288,7 +318,18 @@ def parse_arguments(parser):
                           'gamma' argument for the learning rate scheduler.
                            Default: 0.9.
                            """ ).strip())
+    learn_args.add_argument('--mix_loss', type=int, metavar='INT', default=0, 
+                          help=textwrap.dedent("""
+                          use mixed loss.
+                           Default: 0.
+                           """ ).strip())
 
+    learn_args.add_argument('--dynamic_weight_loss', type=int, metavar='INT', default=0, 
+                          help=textwrap.dedent("""
+                          used when has two loss.
+                           Default: 0.
+                           """ ).strip())
+    
     learn_args.add_argument('--cudnn_benchmark_false', default=False, action='store_true', 
                           help=textwrap.dedent("""
                           If set, torch.backends.cudnn.benchmark will be False. 
@@ -603,11 +644,7 @@ def main():
     else:
         print('NOTE: no bigWig files provided.')
     
-    # Prepare min/max for the loguniform samplers if one value is provided
-    if len(learning_rate) == 1:
-        learning_rate = learning_rate*2
-    if len(weight_decay) == 1:
-        weight_decay = weight_decay*2
+
     
     
     # Use GPU
@@ -616,26 +653,15 @@ def main():
             print('Error: You requested GPU computing, but CUDA is not available! If you want to run without GPU, please set "--ray_ngpus 0 --gpu_per_trial 0"', file=sys.stderr)
             sys.exit()
 
-        from pynvml import nvmlInit, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
-        nvmlInit()
-        gpu_device_number = nvmlDeviceGetCount()
         # Find a GPU with enough memory
-        if cuda_id == None: 
-            args.cuda_id = cuda_id = '0'
-            for i in range(gpu_device_number):
-                h = nvmlDeviceGetHandleByIndex(i)
-                info = nvmlDeviceGetMemoryInfo(h)
-                print('free GPU memory for '+'cuda:'+str(i), info.free/(2**30), 'GB')
-                if info.free > (ray_ncpus/cpu_per_trial)*(2.5*2**30): # Reserve 2.5GB GPU memory per trial
-                    cuda_id = str(i)
-                    break
-            print('CUDA: ', torch.cuda.is_available())
-            print('using'  , 'cuda:'+cuda_id)
+        if cuda_id == None:
+            cuda_id = get_available_gpu(ray_ncpus/cpu_per_trial)
+            args.cuda_id = cuda_id
         # Check cuda_id exists
         else:
-            if gpu_device_number <= int(cuda_id):
-                print(f'Error: GPU Device Count = {gpu_device_number}, but cuda_id = {cuda_id}, please set cuda_id not more than  {gpu_device_number}', file=sys.stderr)
-                sys.eixt()
+            check_cuda_id(cuda_id)
+        print('CUDA: ', torch.cuda.is_available())
+        print('using'  , 'cuda:'+cuda_id)
         print('Train using GPU device', 'cuda:'+cuda_id)
     # Use CPU
     else:
@@ -658,7 +684,7 @@ def main():
         'distal_fc_dropout': distal_fc_dropout[0],
         'batch_size': batch_size[0],
         'sampled_segments': sampled_segments[0],
-        'learning_rate': learning_rate[0],
+        'learning_rate': learning_rate,
         #'learning_rate': tune.choice(learning_rate),
         'optim': optim[0],
         'lr_scheduler':lr_scheduler[0],
@@ -670,11 +696,22 @@ def main():
         'custom_dataloader' : args.custom_dataloader 
     }
         para=False
-        run_train(train, n_trials, config, args,para)
+        if args.grad_accumu:
+            train_func = train_grad_accumu
+        elif args.segment_dataloader:
+            train_func = trainBySegment
+        else:
+            train_func = train
+        run_train(train_func, n_trials, config, args,para)
         #train(config, args)
         print('Total time used: %s seconds' % (time.time() - start_time))
         return 0
 
+    # Prepare min/max for the loguniform samplers if one value is provided
+    if len(learning_rate) == 1:
+        learning_rate = learning_rate*2
+    if len(weight_decay) == 1:
+        weight_decay = weight_decay*2
     # Set visible GPU(s)
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = cuda_id

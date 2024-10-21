@@ -12,6 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
+from model_config import model_choice
+
+
 import pandas as pd
 import numpy as np
 import pickle
@@ -20,14 +24,15 @@ import os
 import time
 import datetime
 
-from MuRaL.nn_models import *
-from MuRaL.nn_utils import *
-from MuRaL.preprocessing import *
-from MuRaL.evaluation import *
+from MuRaL.utils.gpu_utils import get_available_gpu, check_cuda_id
+from MuRaL.models.nn_models import *
+from MuRaL.models.nn_utils import *
+from MuRaL.scripts.training import set_torch_backends
+from MuRaL.evaluation.evaluation import *
 from MuRaL._version import __version__
 
 # from MuRaL.custom_dataloader import MyDataLoader
-from MuRaL.preprocessing import prepare_dataset_np, get_position_info, generate_data_batches
+from MuRaL.data.preprocessing import prepare_dataset_np, get_position_info, generate_data_batches, to_np, prepare_dataset_h5
 
 from pynvml import *
 
@@ -62,6 +67,11 @@ def parse_arguments(parser):
                           File path for the configurations of the trained model.
                           """ ).strip()) 
 
+    optional.add_argument('--cuda_id', type=str, metavar='STR', default=None, 
+                          help=textwrap.dedent("""
+                          Which GPU device to be used. Default: '0'. 
+                          """ ).strip())
+    
     optional.add_argument('--pred_file', type=str, metavar='FILE', default='pred.tsv.gz', help=textwrap.dedent("""
                           Name of the output file for prediction results.
                           Default: 'pred.tsv.gz'.
@@ -113,7 +123,7 @@ def parse_arguments(parser):
                           between RAM memory and preprocessing speed. It is recommended to use 300k.
                           Default: 300000.""" ).strip())
 
-    optional.add_argument('--pred_batch_size', metavar='INT', default=16, 
+    optional.add_argument('--pred_batch_size', type=int, metavar='INT', default=16, 
                           help=textwrap.dedent("""
                           Size of mini batches for prediction. Default: 16.
                           """ ).strip())
@@ -131,6 +141,10 @@ def parse_arguments(parser):
                           Accept one or more positive integers for window size (bp), 
                           e.g., "10000 50000". Default: no value.
                           """ ).strip())
+    optional.add_argument('--use_dilation', 
+                            default=False, 
+                            action='store_true',  
+                            help=textwrap.dedent("""Add this parameter if dilation is used in the model.""" ))
     
     optional.add_argument('-v', '--version', action='version',
                         version='%(prog)s {}'.format(__version__))
@@ -197,6 +211,9 @@ def main():
     
     args = parse_arguments(parser)
 
+    use_dilation = args.use_dilation
+    set_torch_backends(use_dilation)
+
     # Set input file
     test_file = args.test_data   
     ref_genome= args.ref_genome
@@ -209,6 +226,7 @@ def main():
     # Whether to generate H5 file for distal data
     with_h5 = args.with_h5
     n_h5_files = args.n_h5_files
+    h5f_path = args.h5f_path
     cpu_only = args.cpu_only
 
     # Get saved model-related files
@@ -257,6 +275,7 @@ def main():
     seq_only = config['seq_only']
     # custom_dataloader = args.custom_dataloader
     # Print command line
+    cuda_id = args.cuda_id
     print(' '.join(sys.argv))
     for k,v in vars(args).items():
         print("{0}: {1}".format(k,v))
@@ -313,21 +332,15 @@ def main():
     if cpu_only:
         device = torch.device('cpu')
     else:
-        # Find a GPU with enough memory
-        nvmlInit()
-        cuda_id = '0'
-        for i in range(nvmlDeviceGetCount()):
-            h = nvmlDeviceGetHandleByIndex(i)
-            info = nvmlDeviceGetMemoryInfo(h)
-            if info.free > 2.0*(2**30): # Reserve 2GB GPU memory
-                cuda_id = str(i)
-                break
-
+        if cuda_id == None:
+            cuda_id = get_available_gpu(1)
+        else:
+            check_cuda_id(cuda_id)
         print('CUDA: ', torch.cuda.is_available())
         if torch.cuda.is_available():
             print('using'  , 'cuda:'+cuda_id)
         device = torch.device('cuda:'+cuda_id if torch.cuda.is_available() else 'cpu')
-  
+        torch.cuda.set_device(f'cuda:{cuda_id}')
     #####
     if without_bw_distal:
         in_channels = 4**distal_order
@@ -346,8 +359,9 @@ def main():
         model = Network3(emb_dims, no_of_cont=n_cont, lin_layer_sizes=[local_hidden1_size, local_hidden2_size], emb_dropout=emb_dropout, lin_layer_dropouts=[local_dropout, local_dropout], in_channels=in_channels, out_channels=CNN_out_channels, kernel_size=CNN_kernel_size, distal_radius=distal_radius, distal_order=distal_order, distal_fc_dropout=distal_fc_dropout, n_class=n_class, emb_padding_idx=4**local_order).to(device)
 
     else:
-        print('Error: no model selected!')
-        sys.exit() 
+        model = model_choice(model_no, config, emb_dims, distal_order, n_class, n_cont, in_channels)
+        #print('Error: no model selected!')
+        #sys.exit() 
 
     print('model:')
     print(model)
@@ -375,9 +389,23 @@ def main():
 
     # Do the prediction
     if not args.pred_time_view:
-        pred_y, test_total_loss = model_predict_m(model, dataloader, criterion, device, n_class, distal=True)
+        test_preds = model_predict_m(model, dataloader, criterion, device, n_class, distal=True)
     else:
-        pred_y, test_total_loss = run_time_view_model_predict_m(model, dataloader, criterion, device, n_class, distal=True)
+        test_preds = run_time_view_model_predict_m(model, dataloader, criterion, device, n_class, distal=True)
+    
+    local_loss_ipt = False
+    distal_loss2_ipt = False
+    if len(test_preds) == 5:
+        distal_loss2_ipt = True
+        pred_y, test_total_loss, test_local_loss, test_distal_loss, test_distal_loss2 = test_preds
+    elif len(test_preds) == 4:
+        local_loss_ipt = True
+        pred_y, test_total_loss, test_local_loss, test_distal_loss = test_preds
+    elif len(test_preds) == 2:
+        pred_y, test_total_loss = test_preds
+    else:
+        print("Error: check test_preds")
+        sys.exit()
     # Print some data for debugging
     print('pred_y:', F.softmax(pred_y[1:10], dim=1))
     for i in range(1, n_class):
@@ -395,6 +423,13 @@ def main():
             y_prob = pd.DataFrame(data=np.copy(prob_cal), columns=prob_names)
     
     print('Mean Loss, Total Loss, Test Size:', test_total_loss/test_size, test_total_loss, test_size)
+    if local_loss_ipt:
+        print ('Mean local Loss: ', test_local_loss/test_size)
+        print ('Mean distal Loss: ', test_distal_loss/test_size)
+    if distal_loss2_ipt:
+        print ('Mean local Loss: ', test_local_loss/test_size)
+        print ('Mean distal Loss1: ', test_distal_loss/test_size)
+        print('Mean distal Loss2', test_distal_loss2/test_size)
     
     # Combine data 
     data_and_prob = pd.concat([data_local_test, y_prob], axis=1)         

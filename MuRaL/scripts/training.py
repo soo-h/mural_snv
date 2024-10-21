@@ -5,6 +5,9 @@ warnings.filterwarnings('ignore',category=FutureWarning)
 from pybedtools import BedTool
 
 import sys
+sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
+from model_config import model_choice
+
 import argparse
 import pandas as pd
 import numpy as np
@@ -16,10 +19,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.utils.data import random_split
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.allow_tf32 = True
 
 from functools import partial
 import ray
@@ -32,14 +31,30 @@ import time
 import datetime
 import random
 
-from MuRaL.printer_utils import get_printer
-from MuRaL.nn_models import *
-from MuRaL.nn_utils import *
-from MuRaL.evaluation import *
-from MuRaL.custom_dataloader import MyDataLoader
-from MuRaL.preprocessing import *
+from MuRaL.utils.printer_utils import get_printer
+from MuRaL.models.nn_models import *
+from MuRaL.models.nn_utils import *
+from MuRaL.evaluation.evaluation import *
+from MuRaL.data.custom_dataloader import MyDataLoader
+from MuRaL.data.preprocessing import *
 
+from MuRaL.models.custom_loss import *
 
+def set_torch_backends(use_dilation):
+    """Configure PyTorch backend settings based on dilation usage."""
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Set deterministic behavior: when True, training with dilation will be significantly slower(10 times)
+    torch.backends.cudnn.deterministic = not use_dilation
+    display_torch_backends_info()
+
+def display_torch_backends_info():
+    """Display the current PyTorch backend settings."""
+    print(f"TF32 Matmul Enabled: {torch.backends.cuda.matmul.allow_tf32}")
+    print(f"CUDNN Benchmark Enabled: {torch.backends.cudnn.benchmark}")
+    print(f"CUDNN TF32 Enabled: {torch.backends.cudnn.allow_tf32}")
+    print(f"CUDNN Deterministic: {torch.backends.cudnn.deterministic}")
 
 #from torchsampler import ImbalancedDatasetSampler
 def train(config, args, checkpoint_dir=None):
@@ -64,6 +79,9 @@ def train(config, args, checkpoint_dir=None):
     # print("torch.version.cuda():", torch.version.cuda)
     print("torch._C._cuda_getDeviceCount():", torch._C._cuda_getDeviceCount(), file=sys.stderr)
     print("torch.cuda.device_count(): ", torch.cuda.device_count(), file=sys.stderr)
+
+    use_dilation = args.use_dilation
+    set_torch_backends(use_dilation)
 
     # Get parameters from the command line
     train_file = args.train_data # Ray requires absolute paths
@@ -113,9 +131,11 @@ def train(config, args, checkpoint_dir=None):
     h5f_path=args.h5f_path
     use_ray = args.use_ray
     custom_dataloader = args.custom_dataloader
+    segment_dataloader = args.segment_dataloader
     segment_workers = cpu_per_trial - 1
     print("Extral cpu used dataloadr: ", segment_workers)
-
+    mix_loss = args.mix_loss
+    dynamic_weight_loss = args.dynamic_weight_loss
 
     start_time = time.time()
 
@@ -147,7 +167,7 @@ def train(config, args, checkpoint_dir=None):
         step_stime = time.time()
         dataset = prepare_dataset_np(train_bed, ref_genome, bw_files, bw_names, bw_radii, \
                                      config['segment_center'], config['local_radius'], config['local_order'], \
-                                        config['distal_radius'], distal_order, seq_only=seq_only)
+                                        config['distal_radius'], distal_order, seq_only=seq_only, without_bw_distal=without_bw_distal)
         if not dataset.distal_info:
             dataset.get_distal_encoding_infomation()
         print("training set preprocess without H5 used time:", (time.time() - step_stime))
@@ -180,7 +200,8 @@ def train(config, args, checkpoint_dir=None):
         if not with_h5:
             step_time = time.time()
             dataset_valid = prepare_dataset_np(valid_bed, ref_genome, bw_files, bw_names, bw_radii, \
-                                               config['segment_center'], config['local_radius'], config['local_order'], config['distal_radius'], distal_order, seq_only=seq_only)
+                                               config['segment_center'], config['local_radius'], config['local_order'], config['distal_radius'], distal_order, seq_only=seq_only,
+                                               without_bw_distal=without_bw_distal)
             if not dataset_valid.distal_info:
                 dataset_valid.get_distal_encoding_infomation()
             print("validation set preprocess time without H5 used time:", (time.time() - step_time))
@@ -264,6 +285,14 @@ def train(config, args, checkpoint_dir=None):
     #####
     
     # Choose the network model for training
+        
+    config['emb_dims'] = emb_dims    
+    config['no_of_cont'] = n_cont
+    config['lin_layer_sizes']= [config['local_hidden1_size'], config['local_hidden2_size']]
+    config['lin_layer_dropouts']=[config['local_dropout'], config['local_dropout']]
+    config['n_class']=n_class
+    config['emb_padding_idx'] = 4**config['local_order']
+    
     if model_no == 0:
         # Local-only model
         model = Network0(emb_dims, no_of_cont=n_cont, lin_layer_sizes=[config['local_hidden1_size'], config['local_hidden2_size']], emb_dropout=config['emb_dropout'], lin_layer_dropouts=[config['local_dropout'], config['local_dropout']], n_class=n_class, emb_padding_idx=4**config['local_order'])
@@ -279,12 +308,14 @@ def train(config, args, checkpoint_dir=None):
     elif model_no == 3:
         # Combined model
         model = Network3(emb_dims, no_of_cont=n_cont, lin_layer_sizes=[config['local_hidden1_size'], config['local_hidden2_size']], emb_dropout=config['emb_dropout'], lin_layer_dropouts=[config['local_dropout'], config['local_dropout']], in_channels=in_channels, out_channels=config['CNN_out_channels'], kernel_size=config['CNN_kernel_size'], distal_radius=config['distal_radius'], distal_order=distal_order, distal_fc_dropout=config['distal_fc_dropout'], n_class=n_class, emb_padding_idx=4**config['local_order'])
+    elif model_no == 42:
+        # Combined model
+        model = Network3(emb_dims, no_of_cont=n_cont, lin_layer_sizes=[config['local_hidden1_size'], config['local_hidden2_size']], emb_dropout=config['emb_dropout'], lin_layer_dropouts=[config['local_dropout'], config['local_dropout']], in_channels=in_channels, out_channels=config['CNN_out_channels'], kernel_size=config['CNN_kernel_size'], distal_radius=config['distal_radius'], distal_order=distal_order, distal_fc_dropout=config['distal_fc_dropout'], n_class=n_class, emb_padding_idx=4**config['local_order'],
+                         bspline=True)
         
-
     else:
-        print('Error: no model selected!')
-        sys.exit() 
-    
+        model = model_choice(model_no, config, emb_dims, distal_order, n_class, n_cont, in_channels)
+
     model.to(device)
     # Count the parameters in the model
     total_params = count_parameters(model)
@@ -336,6 +367,20 @@ def train(config, args, checkpoint_dir=None):
     
     # Set loss function
     criterion = torch.nn.CrossEntropyLoss(reduction='sum')
+    if mix_loss == 1:
+        combined_loss = partial(combined_mse_loss, criterion=criterion)
+    elif mix_loss == 2:
+        combined_loss = partial(combined_avg_mut_mse_loss, criterion=criterion)
+    elif mix_loss == 3:
+        combined_loss = partial(combined_mse_loss_10mult, criterion=criterion)
+    elif mix_loss == 4:
+        combined_loss = partial(combined_mse_loss_200mult, criterion=criterion)
+    elif mix_loss == 5:
+        combined_loss = partial(combined_mse_loss_100mult, criterion=criterion)
+    elif mix_loss == 6:
+        combined_loss = partial(combined_prob1_mse_loss_100mult,criterion=criterion) 
+    elif mix_loss == 7:
+        combined_loss = partial(combined_var_loss,criterion=criterion)
     #weights = torch.tensor([0.00515898, 0.44976093, 0.23657462, 0.30850547]).to(device)
     #weights = torch.tensor([0.00378079, 0.42361806, 0.11523816, 0.45736299]).to(device)
     #criterion = torch.nn.CrossEntropyLoss(weight=weights, reduction='sum')
@@ -355,22 +400,7 @@ def train(config, args, checkpoint_dir=None):
         print("NOTE: rewriting config['weight_decay'], new weight_decay: ", config['weight_decay'])
     
     # Set Optimizer
-    if config['optim'] == 'Adam':
-        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-
-    elif config['optim'] == 'AdamW':
-        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['learning_rate'], weight_decay=config['weight_decay'], amsgrad=True)
-
-    elif config['optim'] == 'AdamW2':
-        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['learning_rate'], weight_decay=config['weight_decay'], amsgrad=True)
-        
-    elif config['optim'] == 'SGD':
-        optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=config['learning_rate'], weight_decay=config['weight_decay'], momentum=0.98, nesterov=True)
-     
-    else:
-        print('Error: unsupported optimization method', config['optim'])
-        sys.exit()
-
+    optimizer = get_optimizer(config['optim'], model, config['learning_rate'], config['weight_decay'])
 
     #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=config['LR_gamma'])
     if config['lr_scheduler'] == 'StepLR':
@@ -392,6 +422,22 @@ def train(config, args, checkpoint_dir=None):
     min_loss = 0
     min_loss_epoch = 0
     after_min_loss = 0
+    number_batch_view = 1000
+    local_loss_tracker = LossTracker2(number_batch_view)
+    distal_loss_tracker = LossTracker2(number_batch_view)
+    distal_loss_tracker2 = LossTracker2(number_batch_view)
+    total_loss_tracker = LossTracker2(number_batch_view)
+    construct_loss_tracker = LossTracker2(number_batch_view)
+    descrim_loss_tracker = LossTracker2(number_batch_view)
+    module_name = 'large_scale_model'
+    for name, parameter in model.named_parameters():
+        if module_name in name:
+            out_grad = True
+            break
+        else:
+            out_grad = False
+        
+
     if not use_ray:
         early_stopping = EarlyStopping(patience=grace_period, verbose=True)
     # Training loop
@@ -401,9 +447,17 @@ def train(config, args, checkpoint_dir=None):
         epoch_time = time.time()
 
         model.train()
+        training_losses = []
+
         total_loss = 0
+        total_loss1 = 0
+        total_loss2 = 0
         batch_count = 0
         
+        local_loss_tracker.reset()
+        distal_loss_tracker.reset()
+        total_loss_tracker.reset()
+
         if epoch > 0 and config['lr_scheduler'] == 'StepLR2':
             for g in optimizer.param_groups:
                 g['lr'] = config['restart_lr']            
@@ -413,6 +467,8 @@ def train(config, args, checkpoint_dir=None):
         get_batch_time = time.time()
         ############################
         for y, cont_x, cat_x, distal_x in dataloader_train:
+
+            loss_pretext = {}
             time_per_batch_fetch += time.time() - get_batch_time
             batch_count += 1
             ### get batch time view ##############
@@ -420,6 +476,12 @@ def train(config, args, checkpoint_dir=None):
                 print("get 1000 batch used time: ", time_per_batch_fetch)
                 time_per_batch_fetch = 0
             #############################
+
+            if out_grad:
+                if batch_count == 1:
+                    hook1 = model.large_scale_model.register_full_backward_hook(hook_backward_function)
+                if batch_count > 10:
+                    hook1.remove()
             
             batch_train_time = time.time() #
             
@@ -433,13 +495,58 @@ def train(config, args, checkpoint_dir=None):
 
             # Forward Pass
             preds = model.forward((cont_x, cat_x), distal_x)
-            loss = criterion(preds, y.long().squeeze())
+            if isinstance(preds, tuple):
+                if len(preds) == 3:
+                    preds_local, preds_distal, preds = preds
+                    loss_local = criterion(preds_local, y.long().squeeze()) 
+                    loss_distal = criterion(preds_distal, y.long().squeeze())
+                    local_loss_tracker.add_loss(loss_local)
+                    distal_loss_tracker.add_loss(loss_distal)
+                elif len(preds) >= 4:
+                    if len(preds) == 5:
+                        preds, loss_construct = preds[:4], preds[-1]
+                        if isinstance(loss_construct, tuple):
+                            loss_construct, loss_descrim = loss_construct
+                            descrim_loss_tracker.add_loss(loss_descrim)
+                        construct_loss_tracker.add_loss(loss_construct.item()) 
+                        loss_pretext['loss_construct'] = loss_construct
+                    preds_local, preds_distal, preds_distal2, preds = preds
+                    loss_local = criterion(preds_local, y.long().squeeze())
+                    loss_distal = criterion(preds_distal, y.long().squeeze())
+                    loss_distal2 = criterion(preds_distal2, y.long().squeeze())
+                    local_loss_tracker.add_loss(loss_local)
+                    distal_loss_tracker.add_loss(loss_distal)
+                    distal_loss_tracker2.add_loss(loss_distal2)
+                        
+            # if out local and distal res respctively
+            # loss compute
+            if mix_loss:
+                loss, loss1 = combined_loss(preds, y.long().squeeze())
+                total_loss1 += loss1.item()
+            else:
+                loss = criterion(preds, y.long().squeeze())
+            total_loss_tracker.add_loss(loss)
+            training_losses.append(loss.item())
+
+            if loss_pretext.get('loss_construct') is not None:
+                if dynamic_weight_loss:
+                    alpha = dynamic_weight_adjustment(loss, loss_pretext['loss_construct'], scale_factor=0.1)
+                    loss = combined_main_auxiliary(loss, loss_pretext['loss_construct'], alpha)
+                else:
+                    loss += loss_pretext['loss_construct']
+
             optimizer.zero_grad()
             loss.backward()
+
+            # minor ten batch
+            if batch_count <= 10:
+                print_gradients(model, print=print)
             # time view
             if batch_count % 1000 == 0:
                 print(f"Batch Number: {batch_count}; Mean Time of 1000 batch: {(time.time()-step_time) / 60} min")
                 step_time = time.time()
+
+                print_gradients(model, print=print)
             
             #Clips gradient norm to avoid exploding gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, error_if_nonfinite=False)
@@ -467,6 +574,12 @@ def train(config, args, checkpoint_dir=None):
         print('optimizer learning rate:', optimizer.param_groups[0]['lr'])
         # Update learning rate
         #scheduler.step()
+        local_loss_tracker.epoch_end()
+        distal_loss_tracker.epoch_end()
+        distal_loss_tracker2.epoch_end()
+        construct_loss_tracker.epoch_end()
+        descrim_loss_tracker.epoch_end()
+        
         
         model.eval()
         with torch.no_grad():
@@ -474,9 +587,20 @@ def train(config, args, checkpoint_dir=None):
                 #print('F.softmax(model.models_w):', F.softmax(model.models_w, dim=0))
                 #print('model.conv1[0].weight.grad:', model.conv1[0].weight.grad)
             #print('model.conv1.0.weight.grad:', model.conv1.0.weight)
-
-            valid_pred_y, valid_total_loss = model_predict_m(model, dataloader_valid, criterion, device, n_class, distal=True)
-
+            local_loss_ipt = False
+            distal_loss2_ipt = False
+            valid_preds= model_predict_m(model, dataloader_valid, criterion, device, n_class, distal=True, print=print)
+            if len(valid_preds) == 5:
+                distal_loss2_ipt = True
+                valid_pred_y, valid_total_loss, valid_local_loss, valid_distal_loss,valid_distal_loss2 = valid_preds 
+            elif len(valid_preds) == 4:
+                local_loss_ipt = True
+                valid_pred_y, valid_total_loss, valid_local_loss, valid_distal_loss = valid_preds 
+            elif len(valid_preds) == 2:
+                valid_pred_y, valid_total_loss = valid_preds 
+            else:
+                print("Error: check valid_preds")
+                sys.exit()
             valid_y_prob = pd.DataFrame(data=to_np(F.softmax(valid_pred_y, dim=1)), columns=prob_names)
             
             valid_data_and_prob = pd.concat([data_local_valid, valid_y_prob], axis=1)
@@ -498,11 +622,32 @@ def train(config, args, checkpoint_dir=None):
             print('5mer correlation - all: ', freq_kmer_comp_multi(valid_data_and_prob, 5, n_class))
             print('7mer correlation - all: ', freq_kmer_comp_multi(valid_data_and_prob, 7, n_class))
             
-            print ('Training Loss: ', total_loss/train_size)
+            if mix_loss:
+                print(f"Training Loss: {total_loss/train_size}; CrossEntropyLoss: {total_loss1/train_size}")
+            else:
+                print ('Training Loss: ', total_loss/train_size)
             
+            print(f"Training Loss from LossTracker: {total_loss_tracker.report_total_losses()/train_size}")
+            if local_loss_tracker.stored_losses:
+                print(f"Training Local Loss from LossTracker: {local_loss_tracker.report_total_losses()/train_size}")
+            if distal_loss_tracker.stored_losses:
+                print(f"Training Distal Loss1 from LossTracker: {distal_loss_tracker.report_total_losses()/train_size}")
+            if distal_loss_tracker2.stored_losses:
+                print(f"Training Distal Loss2 from LossTracker: {distal_loss_tracker2.report_total_losses()/train_size}")
+            if construct_loss_tracker.stored_losses:
+                print(f"construct Loss from LossTracker: {construct_loss_tracker.report_total_losses()/batch_count}")
+            if descrim_loss_tracker.stored_losses:
+                print(f"descrim Loss from LossTracker: {descrim_loss_tracker.report_total_losses()/batch_count}")
+
             print ('Validation Loss: ', valid_total_loss/valid_size)
             print ('Validation Loss (after fdiri_cal): ', fdiri_nll)
-            
+            if local_loss_ipt:
+                print ('Validation local Loss: ', valid_local_loss/valid_size)
+                print ('Validation distal Loss: ', valid_distal_loss/valid_size)
+            if distal_loss2_ipt:
+                print ('Validation local Loss: ', valid_local_loss/valid_size)
+                print ('Validation distal Loss1: ', valid_distal_loss/valid_size)
+                print('Validation distal Loss2: ', valid_distal_loss2/valid_size)
             ###########
             prob_cal = fdiri_cal.predict_proba(valid_y_prob.to_numpy())  
             y_prob = pd.DataFrame(data=np.copy(prob_cal), columns=prob_names)
@@ -573,7 +718,7 @@ def train(config, args, checkpoint_dir=None):
             if not use_ray:
                 # Define a directory to save the files when not using Ray
                 #non_ray_checkpoint_dir = f'results/{args.experiment_name}/check_point{epoch}'
-                non_ray_checkpoint_dir = f'{trial_dir}/check_point{epoch}'
+                non_ray_checkpoint_dir = f'{trial_dir}/checkpoint_{epoch}'
                 os.makedirs(non_ray_checkpoint_dir, exist_ok=True)
                 path = os.path.join(non_ray_checkpoint_dir, 'model')
                 save_model_and_files(model, fdiri_cal, config, valid_pred_df, path, save_valid_preds)
@@ -612,9 +757,16 @@ def train(config, args, checkpoint_dir=None):
                     }
                 report_path = os.path.join(non_ray_checkpoint_dir, f'epoch_{epoch}_metrics.txt')
                 report_metrics(metrics, report_path)
+                
+                
+                losses_path = os.path.join(non_ray_checkpoint_dir, f'epoch_{epoch}_losses.json')
+                save_losses(training_losses, losses_path)
+                
                 if early_stopping.early_stop:
+                    print(f"Epoch {epoch} used time:{time.time()-epoch_time} seconds!")
                     print("Early stopping")
                     break
+                
 
             #####
             if config['lr_scheduler'] == 'ROP':
@@ -630,6 +782,7 @@ def train(config, args, checkpoint_dir=None):
             dataloader_train = generate_data_batches(segmentLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True)
             dataloader_valid = generate_data_batches(segmentLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False)
 
+        batch_count = 0
 
     print(f"dital_radius: {distal_radius} training finish, {epoch} epochs total time:{time.time()-start_time} min!")
     best_epoch = epoch - early_stopping.counter
@@ -657,3 +810,62 @@ def report_metrics(metrics, report_path=None):
     else:
         for key, value in metrics.items():
             print(f"{key}: {value}")
+
+def save_losses(losses, path=None):
+    import json
+    if path:
+        with open(path, 'w') as f:
+            json.dump(losses, f)
+    else:
+        print('Epoch Loss: ', '\t'.join([str(x) for x in losses]))
+
+def get_optimizer(optim_name, 
+                  model, 
+                  learning_rates, 
+                  weight_decay):
+    """
+    Initialize the optimizer with specific learning rates for different parts of the model.
+
+    Args:
+        optim_name (str): The name of the optimizer ('Adam', 'AdamW', 'SGD', etc.).
+        model (nn.Module): The model containing different scale models.
+        learning_rates (Union[float, list]): A list of learning rates for each scale model or a single learning rate.
+        weight_decay (float): The weight decay (L2 penalty).
+
+    Returns:
+        torch.optim.Optimizer: The initialized optimizer.
+    """
+    
+    # Validate learning_rates type
+    if not isinstance(learning_rates, (float, list)):
+        raise TypeError("learning_rates should be a float or a list.")
+    
+    if isinstance(learning_rates, list):
+        if len(learning_rates) == 3:
+            params = [
+                {'params': filter(lambda p: p.requires_grad, model.local_scale_model.parameters()), 'lr': learning_rates[0]},
+                {'params': filter(lambda p: p.requires_grad, model.middle_scale_model.parameters()), 'lr': learning_rates[1]},
+                {'params': filter(lambda p: p.requires_grad, model.large_scale_model.parameters()), 'lr': learning_rates[2]}
+            ]
+
+        elif len(learning_rates) == 1:
+            params = [{'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr': learning_rates[0]}]
+        else:
+            raise ValueError(f"For a model without scale models, provide a single or three learning rate! not <{learning_rates}>")
+        
+    else:
+        # When a single float is provided
+        params = [{'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr': learning_rates}]
+
+    # Select the optimizer based on the provided name
+    optimizers = {
+        'Adam': torch.optim.Adam,
+        'AdamW': torch.optim.AdamW,
+        'SGD': torch.optim.SGD
+    }
+
+    if optim_name not in optimizers:
+        raise ValueError(f"Unsupported optimization method '{optim_name}'")
+
+    optimizer = optimizers[optim_name](params, weight_decay=weight_decay)
+    return optimizer

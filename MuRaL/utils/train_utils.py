@@ -7,6 +7,9 @@ import re
 import multiprocessing
 from multiprocessing import Process
 
+sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils/')
+from minor_view import plot_minor
+
 def get_trialid(count, local_dir):
     global unique_id
     if count == 0:
@@ -75,7 +78,9 @@ def run_train(train, n_trials, config, args, para=False):
             args = wrap_args(args, trial_dir)
 
             train(config, args)
-    
+            # view minor
+            plot_minor(args.trial_training_log)
+
     # out best model in n_trials
     output_best_mural_model(trial_dir_list, args.tmp_log_file)
 
@@ -106,7 +111,7 @@ def get_best_model_from_trial(trial_dir, minor='loss'):
     best_loss = float('inf')
     best_checkpoint  = None
     
-    checkpoint_prefix = 'check_point'
+    checkpoint_prefix = 'checkpoint_'
     checkpoint_num = max([extract_number_from_checkpoint(name) \
                           for name in os.listdir(trial_dir) if name.startswith(checkpoint_prefix)])
     progress_message = ''

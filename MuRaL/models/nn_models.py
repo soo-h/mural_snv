@@ -13,9 +13,11 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn import metrics, calibration
 from scipy.special import lambertw
 
-from MuRaL.nn_utils import *
-from MuRaL.evaluation import *
+from MuRaL.models.nn_utils import *
+from MuRaL.evaluation.evaluation import *
 
+sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/MuRaL-master/MuRaL/models/')
+from nn_layers import BSplineTransformation
 class FeedForwardNN(nn.Module):
     """Feedforward only model with local data"""
 
@@ -526,7 +528,9 @@ class Network2(nn.Module):
 
 class Network3(nn.Module):
     """Combined model with FeedForward and ResNet componets"""
-    def __init__(self,  emb_dims, no_of_cont, lin_layer_sizes, emb_dropout, lin_layer_dropouts, in_channels, out_channels, kernel_size, distal_radius, distal_order, distal_fc_dropout, n_class, emb_padding_idx=None):
+    def __init__(self,  emb_dims, no_of_cont, lin_layer_sizes, emb_dropout, lin_layer_dropouts, in_channels, out_channels, kernel_size, distal_radius, distal_order, distal_fc_dropout, n_class, 
+                 emb_padding_idx=None,
+                 bspline=False):
         """  
         Args:
             emb_dims: embedding dimensions
@@ -563,12 +567,15 @@ class Network3(nn.Module):
         self.no_of_cont = no_of_cont
 
         # Linear Layers
-        first_lin_layer = nn.Linear(self.no_of_embs, lin_layer_sizes[0])
+        if self.no_of_cont:
+            first_lin_layer = nn.Linear(self.no_of_embs + self.no_of_cont, lin_layer_sizes[0])
+        else:
+            first_lin_layer = nn.Linear(self.no_of_embs, lin_layer_sizes[0])
 
         self.lin_layers = nn.ModuleList([first_lin_layer] + [nn.Linear(lin_layer_sizes[i], lin_layer_sizes[i + 1]) for i in range(len(lin_layer_sizes) - 1)])
 
         # Batch Norm Layers
-        #self.first_bn_layer = nn.BatchNorm1d(self.no_of_cont)
+        self.first_bn_layer = nn.BatchNorm1d(self.no_of_cont)
         self.bn_layers = nn.ModuleList([nn.BatchNorm1d(size) for size in lin_layer_sizes])
 
         # Dropout Layers
@@ -577,6 +584,7 @@ class Network3(nn.Module):
         
         self.kernel_size = kernel_size
         self.seq_len = distal_radius*2+1 - (distal_order-1)
+        self.bspline = bspline
         
 
         rb1_kernel_size = 3
@@ -654,14 +662,22 @@ class Network3(nn.Module):
             nn.Conv1d(out_channels, out_channels, kernel_size, 1, (kernel_size-1)//2),
             nn.ReLU(),
         )
-        
-        cnn_fc_in_size = out_channels
 
+        
+        self.cnn_fc_in_size = cnn_fc_in_size = out_channels
+        feature_length=1
+
+        if self.bspline:
+            self.feature_size = feature_length = 16
+            self.spline_tr = nn.Sequential(
+                nn.Dropout(distal_fc_dropout),
+                BSplineTransformation(feature_length,scaled=False)
+            )
         # Separate FC layers for distal and local data
         self.distal_fc2 = nn.Sequential(
-            nn.BatchNorm1d(cnn_fc_in_size),
+            nn.BatchNorm1d(cnn_fc_in_size*feature_length),
             nn.Dropout(distal_fc_dropout), 
-            nn.Linear(cnn_fc_in_size, n_class), 
+            nn.Linear(cnn_fc_in_size*feature_length, n_class), 
             #nn.ReLU(),
             
         )
@@ -698,7 +714,6 @@ class Network3(nn.Module):
         local_out = torch.cat(local_out, dim = 1) #x.shape: batch_size * sum(emb_size)
         local_out = self.emb_dropout_layer(local_out)
         
-        """
         if self.no_of_cont != 0:
             normalized_cont_data = self.first_bn_layer(cont_data)
 
@@ -706,7 +721,6 @@ class Network3(nn.Module):
                 local_out = torch.cat([local_out, normalized_cont_data], dim = 1) 
             else:
                 local_out = normalized_cont_data
-        """
         
         for lin_layer, dropout_layer, bn_layer in zip(self.lin_layers, self.droput_layers, self.bn_layers):
             local_out = F.relu(lin_layer(local_out))
@@ -760,7 +774,12 @@ class Network3(nn.Module):
         distal_out2 = self.maxpool3_2(distal_out2)
         
         distal_out2 = self.conv3_2(distal_out2)
-        distal_out2, _ = torch.max(distal_out2, dim=2)
+
+        if self.bspline:
+            distal_out2 = self.spline_tr(distal_out2)
+            distal_out2 = distal_out2.view(distal_out2.size(0), self.cnn_fc_in_size * self.feature_size)
+        else:
+            distal_out2, _ = torch.max(distal_out2, dim=2)
         
 
         distal_out2 = self.distal_fc2(distal_out2)
@@ -784,8 +803,10 @@ class Network3(nn.Module):
         #out = torch.log(torch.clamp((local_out + distal_out)/2*local_out2, min=1e-9))  
         if self.no_of_cont > 0:
             out = torch.log(torch.clamp((local_out + distal_out + local_out2)/3, min=1e-9))
+            return local_out, local_out2,   distal_out, out
         else:
             out = torch.log(torch.clamp((local_out + distal_out)/2, min=1e-9))
+            return local_out, distal_out, out
         
         return out
 

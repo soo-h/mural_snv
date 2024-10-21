@@ -38,6 +38,49 @@ def count_parameters(model):
     print(f"Total Trainable Params: {total_params}")
     
     return total_params
+
+def check_gradients(module, loss):
+    """
+    检查给定模块的梯度是否正常（非零）。
+    
+    参数：
+    module (nn.Module): 需要检查的模块
+    """
+    # 获取所有参数及其名称
+    named_parameters = list(module.named_parameters())
+    
+    # 获取所有参数的梯度
+    gradients = [param.grad for _, param in named_parameters if param.grad is not None]
+
+    if not gradients:
+        print(f"No grad to used. Loss is {loss}!")
+        return
+    
+def print_gradient_norms(model, print=print):
+    """
+    计算梯度的L1和L2范数
+    
+    :param gradients: 需要计算的梯度，可以是一个张量或张量列表
+    :return: L1范数和L2范数
+    """
+    total_norm = 0
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            total_norm += param.grad.data.norm(2).item() ** 2
+    print(f"Gradient L2 norms: total {total_norm}")
+
+def print_gradients(model, print=print):
+    print("Layer-wise Gradient Distribution:")
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad = param.grad
+            print(f"{name} - mean: {grad.mean().item():.6f}, std: {grad.std().item():.6f}, "
+                  f"min: {grad.min().item():.6f}, max: {grad.max().item():.6f}")
+        else:
+            print(f"{name} - No gradient computed")
+            
+def hook_backward_function(module, input_grad, output_grad):
+    print("distal_module output grad:", output_grad)
     
 def f3mer_comp(data_and_prob):
     """Compare the observed and predicted frequencies of mutations in 3-mers"""

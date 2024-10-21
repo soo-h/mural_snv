@@ -19,13 +19,13 @@ import os
 import time
 import datetime
 
-from MuRaL.printer_utils import get_printer
-from MuRaL.nn_models import *
-from MuRaL.nn_utils import *
-from MuRaL.preprocessing import *
-from MuRaL.train_utils import run_train
-from MuRaL.evaluation import *
-from MuRaL.training import *
+from MuRaL.utils.printer_utils import get_printer
+from MuRaL.models.nn_models import *
+from MuRaL.models.nn_utils import *
+from MuRaL.data.preprocessing import *
+from MuRaL.utils.train_utils import run_train
+from MuRaL.evaluation.evaluation import *
+from MuRaL.scripts.training import *
 from MuRaL._version import __version__
 
 
