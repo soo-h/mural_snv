@@ -1,0 +1,17 @@
+Bootstrap: docker-archive
+
+From: miniconda3.tar
+
+%files
+	packed_environment_v112.tar.gz /packed_environment_v112.tar.gz
+
+%environment
+    export NUMBA_CACHE_DIR=/tmp/numba_cache
+
+%post
+    apt-get update
+    apt-get install -y rsync 
+	
+    tar xvzf /packed_environment_v112.tar.gz -C /opt/conda
+	conda-unpack
+	rm /packed_environment_v112.tar.gz

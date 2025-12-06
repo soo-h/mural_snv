@@ -1,0 +1,6 @@
+Metadata-Version: 2.1
+Name: MuRaL
+Version: 1.1.2
+Summary: Mutation Rate Learner with Neural Networks
+Author-email: caililab@outlook.com
+License-File: LICENSE

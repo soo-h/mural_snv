@@ -1,0 +1,7 @@
+#!python
+#-*- coding: utf-8 -*-
+
+from MuRaL.scripts.run_train_raytune import main
+
+if __name__ == "__main__":
+    main()

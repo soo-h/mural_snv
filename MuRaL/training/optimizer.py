@@ -32,12 +32,14 @@ def get_optimizer(optim_name,
     optimizer = optimizers[optim_name](params, weight_decay=weight_decay)
     return optimizer
 
-def get_weight_decay(batch_size, epochs, train_size, weight_decay):
-    if weight_decay is not None and weight_decay > 0:
-        if weight_decay >= 1:
+def get_weight_decay(batch_size, epochs, train_size, weight_decay_auto, weight_decay):
+    if weight_decay_auto is not None and weight_decay_auto > 0:
+        if weight_decay_auto >= 1:
             sys.exit("Error: Please set a value smaller than 1 for --weight_decay_auto.")
-
-    weight_decay_auto = 1- weight_decay **(batch_size/(epochs*train_size))
+        weight_decay_auto = 1- weight_decay_auto **(batch_size/(epochs*train_size))
+    else:
+        weight_decay_auto = weight_decay
+        
     return weight_decay_auto
 
 

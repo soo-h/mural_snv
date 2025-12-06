@@ -56,6 +56,29 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def adapt_calc_loss_strategy(strategy):
+    if strategy == 'AvgSegMutUseInLocalv2':
+        return 'AvgSegMutUseInLocal'
+    return strategy
+def get_calc_segment_info_method(calc_strategy, print=print):
+    if calc_strategy == 'AvgSegmentLabel_withGAN' or calc_strategy == 'AvgSegmentLabel_withGAN2':
+        method = 'SegMut'
+    elif calc_strategy == 'AvgSegMutUseInLocal' or calc_strategy == 'AvgSegMutAndNucSkewUseInLocal':
+        method = 'SegMutRate'
+    elif calc_strategy == 'AvgSegAndKmerMut' or calc_strategy == 'AvgSegMutAndKmerMutUseInLocal':
+        method = 'AvgSegMutAndKmerMut'
+    elif calc_strategy == 'AvgSegMutUseInLocalv2':
+        method = 'SegMutRateByRegion'
+    elif calc_strategy == 'AvgStepMutAndKmerMutUseInLocal' or calc_strategy == 'AvgStepMutAndKmerMutCominedLoss':
+        method = 'AvgStepMutAndKmerMut'
+    elif calc_strategy == 'AvgStepMutUseInLocal':
+        method = 'AvgStepMut'
+    else:
+        method = None
+
+    print("Segment Info utils strategy: ", method)
+    return method
+
 def train(config, args, checkpoint_dir=None):
     """
     Training funtion.
@@ -90,12 +113,20 @@ def train(config, args, checkpoint_dir=None):
         'n_h5_files' : args.n_h5_files,
         'without_bw_distal' : args.without_bw_distal,
         'bw_paths' : args.bw_paths,
+        'segment_length_config' : args.use_segment_length_config,
+        'trial_dir' : args.trial_dir,
+        'slid_strategy' : args.sliding_strategy,
+        'step_avg_strategy': args.step_avg_strategy
     }
+
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5, printer=print)
-    dataset = preprocessor_pipline.preprocess_dataset(args.train_data, args.ref_genome, use_segment_task=args.use_segment_task)
+    segment_calc_method = get_calc_segment_info_method(args.calc_loss_strategy_name, print=print)
+    calc_loss_strategy_name = adapt_calc_loss_strategy(args.calc_loss_strategy_name)
+    print("single_base_task:", args.use_single_base_task)
+    dataset = preprocessor_pipline.preprocess_dataset(args.train_data, args.ref_genome, use_segment_task=args.use_segment_task, distal_encoding=args.distal_encoding, segment_calc_method=segment_calc_method, path_type=args.path_type, single_base_task=args.use_single_base_task)
 
     if args.validation_data:
-        dataset_valid = preprocessor_pipline.preprocess_dataset(args.validation_data, args.ref_genome, use_segment_task=args.use_segment_task)
+        dataset_valid = preprocessor_pipline.preprocess_dataset(args.validation_data, args.ref_genome, use_segment_task=args.use_segment_task, distal_encoding=args.distal_encoding, segment_calc_method=segment_calc_method, path_type=args.path_type, single_base_task=args.use_single_base_task)
         dataset_train = dataset
     else:
         print("Error: validation should provided.")
@@ -131,11 +162,16 @@ def train(config, args, checkpoint_dir=None):
 
     # model choice
     # model config
+    config['no_of_cont'] = len(dataset.cont_cols)
+    if calc_loss_strategy_name == 'AvgSegMutUseInLocal' or calc_loss_strategy_name == 'AvgSegMutAndNucSkewUseInLocal' or calc_loss_strategy_name == 'AvgSegMutAndKmerMutUseInLocal' or calc_loss_strategy_name == 'AvgStepMutAndKmerMutUseInLocal' \
+        or calc_loss_strategy_name == 'AvgStepMutUseInLocal':
+        config['no_of_cont'] += 3
+
     emb_dims = [(x, min(16, int(x**0.25))) for x in dataset.cat_dims] 
     config['emb_dims'] = emb_dims 
-    config['no_of_cont'] = len(dataset.cont_cols)
     config['lin_layer_sizes']= [config['local_hidden1_size'], config['local_hidden2_size']]
     config['lin_layer_dropouts']=[config['local_dropout'], config['local_dropout']]
+    config['avg_mut_dropout'] = config['avg_mut_dropout']
     config['n_class']=n_class
     config['emb_padding_idx'] = 4**config['local_order']
     config['n_class'] = n_class
@@ -147,7 +183,11 @@ def train(config, args, checkpoint_dir=None):
     config['min_lr'] = args.min_lr
     model_factory = ModelFactory(config, args)
     model = model_factory.create_model(args.model_no)
-    model.apply(weights_init)
+
+    if args.load_model_path:
+        model_load(model, args.load_model_path, freeze=True, device=device)
+    else:
+        model.apply(weights_init)
 
     model.to(device)
     total_params = count_parameters(model)
@@ -157,9 +197,9 @@ def train(config, args, checkpoint_dir=None):
     # loss and optimizer
     loss_factory = LossFactory()
     criterion = loss_factory.create_loss()
-    loss_calculator = LossCalcStrategyFactory.get_loss_strategy(args.calc_loss_strategy_name)
+    loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=args.mix_loss)
 
-    config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto) 
+    config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto, config['weight_decay']) 
     optimizer = get_optimizer(config['optim'], model, config['learning_rate'], config['weight_decay'])
     scheduler = get_lr_scheduler(config['lr_scheduler'], optimizer, train_size, config)
 
@@ -171,8 +211,9 @@ def train(config, args, checkpoint_dir=None):
 
     Observer = [TimeMinor(out_after_n_batch=1000, printer=print), 
                 GradMinor(out_after_n_batch=1000, printer=print), 
-                LossMinor(printer=print)]
-    trainer = Trainer(model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=Observer, printer=print)
+                LossMinor(calc_loss_strategy_name, printer=print)]
+    trainer = Trainer(model, optimizer, scheduler, loss_calculator, criterion, device, config, 
+                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
 
     if not args.use_ray:
         early_stopping = EarlyStopping(patience=args.grace_period, verbose=True)
@@ -248,13 +289,25 @@ def train(config, args, checkpoint_dir=None):
         print(f"Epoch {epoch} used time:{time.time()-epoch_time} seconds!")
         sys.stdout.flush()
 
-        dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True)
-        dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False)
+        dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=args.use_segment_task)
+        dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=args.use_segment_task)
 
 
     print(f"dital_radius: {args.distal_radius} training finish, {epoch} epochs total time:{time.time()-start_time} min!")
     best_epoch = epoch - early_stopping.counter
     print(f"Best Epoch: {best_epoch}")
+
+def freeze_without_large_scale_model(model):
+    for name, param in model.named_parameters():
+        if 'large_scale_model' not in name:
+            param.requires_grad = False
+            print(f'Freeze parameter: {name}')
+
+def model_load(model, load_path, freeze, device):
+    model_state = torch.load(load_path, map_location=device)
+    model.load_state_dict(model_state)
+    if freeze:
+        freeze_without_large_scale_model(model)
 
 def save_model_metrics(use_ray, non_ray_checkpoint_dir, epoch, after_min_loss, total_params, minor_metrics):
     if use_ray:
