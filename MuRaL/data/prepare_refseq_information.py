@@ -8,10 +8,25 @@ from MuRaL.data.preprocessing import bed_reader
 #         'segment_avg_mut' : [],
 #     }
 
-def prepare_single_base_info(bed_regions, segment_length, seq_record, single_base_task_config):
-    radius_length = single_base_task_config['radius_length']
-    bin_size = single_base_task_config['bin_size']
-    cumulated = single_base_task_config.get('cumulated')
+def get_single_base_task_config(use_single_base_task):
+    default_config = {
+        'radius_length': 1000,
+        'bin_size': 1000,
+    }
+    config_map = {
+        'S_profile_8k_cumulated': {
+            'radius_length': 8000,
+            'bin_size': 1000,
+            'cumulated': True,},
+
+        'S_profile_25k_cumulated': {
+            'radius_length': 25000,
+            'bin_size': 1000,
+            'cumulated': True,}
+    }
+    return config_map.get(use_single_base_task, default_config)
+
+def compute_nuc_skew(bed_regions, segment_length, seq_record, radius_length, bin_size, cumulated=False):
 
     single_base_info = {
         'nuc_skew': [],
@@ -26,7 +41,7 @@ def prepare_single_base_info(bed_regions, segment_length, seq_record, single_bas
 
         nuc_skew = get_single_base_info_in_segment(batch, radius_length, length, long_seq, bin_size, cumulated)
         single_base_info['nuc_skew'].append(nuc_skew)
-    return single_base_info
+    return single_base_info['nuc_skew']
 
 def get_single_base_info_in_segment(batch, radius_length, length, long_seq, bin_size, cumulated=False):
     S_value_list = []

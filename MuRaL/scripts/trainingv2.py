@@ -41,6 +41,7 @@ from MuRaL.models.nn_utils import *
 from MuRaL.evaluation.evaluation import *
 from MuRaL.data.custom_dataloader import MyDataLoader
 from MuRaL.data.preprocessing import *
+from MuRaL.data.dataset import dict_to_tuple_collate
 
 from MuRaL.models.custom_loss import *
 from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory
@@ -140,11 +141,11 @@ def train(config, args, checkpoint_dir=None):
     # data loader
     segment_workers = args.cpu_per_trial - 1
     #dataloader_train = generate_data_batches_v2(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True)
-    segmentDatasetLoader_train = DataLoader(dataset_train, 1, shuffle=True, num_workers=segment_workers, pin_memory=False)
+    segmentDatasetLoader_train = DataLoader(dataset_train, 1, shuffle=True, num_workers=segment_workers, pin_memory=False, collate_fn=dict_to_tuple_collate)
     dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=args.use_segment_task)
         
     #dataloader_valid = generate_data_batches_v2(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False)
-    segmentDatasetLoader_valid = DataLoader(dataset_valid, 1, shuffle=False, num_workers=segment_workers, pin_memory=False)
+    segmentDatasetLoader_valid = DataLoader(dataset_valid, 1, shuffle=False, num_workers=segment_workers, pin_memory=False, collate_fn=dict_to_tuple_collate)
     dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=args.use_segment_task)
 
     # get device

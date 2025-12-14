@@ -13,6 +13,37 @@ import numpy as np
 from MuRaL.data.preprocessing import distal_encoding_by_region, annot_encoding_by_region, get_distal_seqs_by_region , kmer_encoding_by_region, bpe_encoding_by_region
 from transformers import AutoTokenizer
 
+def dict_to_tuple_collate(batch):
+    """
+    将 dict batch 转换为旧 Model 期望的 tuple 格式
+    
+    Args:
+        batch: List[dict], where dict = {
+            'y': tensor,
+            'cat_x': tensor,
+            'distal_x': tensor,
+            'segment_features': tensor,  # optional
+            ...
+        }
+    
+    Returns:
+        根据 batch 的键动态组装 tuple
+    """
+    # 1. 标准的 dict batch 化
+    dict_batch = default_collate(batch)
+    
+    # 2. 按固定顺序转为 tuple（兼容旧 Model）
+    required_keys = ['y', 'cat_x', 'distal_x']
+    result = [dict_batch[key] for key in required_keys]
+    
+    # 3. 可选字段
+    optional_keys = ['step_avg_mut', 'segment_avg_kmer_mut', 'nuc_skew']
+    for key in optional_keys:
+        if key in dict_batch:
+            result.append(dict_batch[key])
+    
+    return tuple(result)
+
 ##########################
 ######## Return Strategy
 
@@ -250,15 +281,24 @@ def return_strategy(segment_task, annot_infomation, segment_calc_method, single_
 ########################################################################
 # distal encoding Strategy
 ####################### 
-def distal_encoding_strategy(without_bw_distal, distal_encoding, distal_radius, records, bw_fh):
-    if without_bw_distal:
-        if distal_encoding == 'kmer':
-            return EncodingKmerStrategy(distal_radius, records)
-        elif distal_encoding == 'bpe':
-            return EncodingBPEStrategy(distal_radius, records)
-        return EncodingWithoutAnnotStrategy(distal_radius, records)
-    else:
-        return EncodingWithAnnotStrategy(distal_radius, records, bw_fh)
+
+# 弃用，因为annot feature和distal feature分开管理，只需在输入模型前将两者合并即可
+# def distal_encoding_strategy(without_bw_distal, distal_encoding, distal_radius, records, bw_fh):
+#     if without_bw_distal:
+#         if distal_encoding == 'kmer':
+#             return EncodingKmerStrategy(distal_radius, records)
+#         elif distal_encoding == 'bpe':
+#             return EncodingBPEStrategy(distal_radius, records)
+#         return EncodingWithoutAnnotStrategy(distal_radius, records)
+#     else:
+#         return EncodingWithAnnotStrategy(distal_radius, records, bw_fh)
+
+def distal_encoding_strategy(distal_encoding, distal_radius, records):
+    if distal_encoding == 'kmer':
+        return EncodingKmerStrategy(distal_radius, records)
+    elif distal_encoding == 'bpe':
+        return EncodingBPEStrategy(distal_radius, records)
+    return EncodingWithoutAnnotStrategy(distal_radius, records)
 
 class BaseEncodingStrategy:
     def __init__(self, distal_radius, records, bw_fh=None) -> None:
@@ -309,13 +349,22 @@ class EncodingBPEStrategy(BaseEncodingStrategy):
 class CombinedDatasetNPv2(Dataset):
     """Combine local data and distal into Dataset, using NumPy functions"""
 
-    def __init__(self, data, seq_cols, cat_cols, output_col, 
-                 ref_genome, bed_regions, central_radius, distal_radius, 
-                 n_channels, bw_files, seq_only, without_bw_distal, 
-                 segment_task=False, 
-                 distal_encoding=None, 
-                 segment_calc_method=None,
-                 single_base_info=None):
+    def __init__(
+        self, 
+        data, 
+        seq_cols, 
+        cat_cols, 
+        output_col, 
+        ref_genome, 
+        bed_regions, 
+        central_radius, 
+        distal_radius, 
+        distal_order, 
+        seq_only, 
+        distal_encoding=None, 
+        segment_calc_method=None,
+        feature_sources = None,
+        ):
         """
         Args:
             data: DataFrame containing local seq data and categorical data
@@ -323,10 +372,14 @@ class CombinedDatasetNPv2(Dataset):
             cat_cols: names of categorical columns used for training
             output_col: name of the label column
             n_channels: number of channels (columns) in distal data to be extracted
+        
+        TO DO: 
+            1. split distal encoding to feature source (实时生成feature)
+            2. split cat_x to feature source (ComputedFeatureSource)
+
         """
         self._validate_inputs(bed_regions, ref_genome)
         self.seq_cols = seq_cols
-        self.data_local = self._process_local_data(data, seq_cols, output_col)
         self.n = self._get_sample_size(data)
         self.y = self._get_output_labels(data, output_col)
 
@@ -335,37 +388,22 @@ class CombinedDatasetNPv2(Dataset):
         self.cont_X = self._get_continuous_data(data, output_col)
         self.cat_X = self._get_categorical_data(data)
         self.distsal_X = None
+        self.feature_sources = feature_sources
 
-        if bw_files:
-            use_bw = True
-            self.bw_fh = self._open_bw_files(bw_files)
-        else:
-            use_bw = False
-            self.bw_fh = []
-        
-        if segment_task is False:
-            set_segment_task = False
-        else:
-            set_segment_task = True
-
-        self.n_channels, self.seq_only, self.distal_radius, self.central_radius = n_channels, seq_only, distal_radius, central_radius
+        self.seq_only, self.distal_radius, self.central_radius = seq_only, distal_radius, central_radius
         self.bed_regions, self.records = bed_regions, ref_genome
-        self.distal_info, self.segment_task = False, segment_task
-        self.single_base_info = single_base_info
+        self.distal_info = False
 
         if not use_bw:
             without_bw_distal = True
 
-        self.distal_encoding_strategy = distal_encoding_strategy(without_bw_distal, 
+        self.distal_encoding_strategy = distal_encoding_strategy(
                                                              distal_encoding,
                                                              self.distal_radius, 
                                                              self.records, 
-                                                             self.bw_fh)
-        self.return_strategy = return_strategy(set_segment_task, use_bw, segment_calc_method, single_base_info)
-        # two question: 1. multi core 2. add function convert to tensor
-        #self.return_strategy = self.return_strategy.return_dataset
-        self.return_strategy = self.return_strategy.return_segment_samples
+                                                             )
 
+        # two question: 1. multi core 2. add function convert to tensor
         self.get_distal_encoding_infomation()
 
     def _validate_inputs(self, bed_regions, ref_genome):
@@ -416,7 +454,17 @@ class CombinedDatasetNPv2(Dataset):
         """Generate one batch of data."""
         seqs = self.seqs_list[index]
         batch_distal = self.distal_encoding_strategy.calculate(seqs, self.batch_shape[index])
-        return self.return_strategy(self.y, self.cat_X, self.cont_X, batch_distal, self.segment_task, self.single_base_info, index)
+
+        features ={
+            'y': self.y.loc[index].values.reshape(-1, 1),
+            'cat_X': self.cat_X.loc[index].values,
+            'distal_X': batch_distal,
+        } 
+        if self.feature_sources:
+            region = self.bed_regions[index]
+        for feature_name in self.feature_sources:
+            features[feature_name] = self.feature_sources[feature_name].get(region, index)
+        return features
 
     def get_distal_encoding_infomation(self):
         """Get distal sequence information."""

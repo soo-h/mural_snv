@@ -575,7 +575,7 @@ def prepare_local_datav2(bed_regions,ref_genome, bw_files, bw_names, bw_radii, c
     print('categorical_features:', categorical_features)
 
     y = pd.concat(y, keys=range(len(y)))
-    output_feature = 'mut_type'
+    col_name_label = 'mut_type'
 
     # Add feature data in bigWig files
     # bug seq_only = false , concat multi Index dataframe and Index dataframe
@@ -586,7 +586,7 @@ def prepare_local_datav2(bed_regions,ref_genome, bw_files, bw_names, bw_radii, c
     else:
         data_local = pd.concat([local_seq_cat2, y], axis=1)
 
-    return data_local, seq_cols, categorical_features, output_feature
+    return data_local, seq_cols, categorical_features, col_name_label
 
 
 
