@@ -1,0 +1,38 @@
+{
+  "features": {
+    "step_avg_mut": {
+      "loading": "eager",
+      "type": "hdf5",
+      "path": "/public3/home/songhui/data/.../wg.AT_sites.step_avg_mut.h5",
+      "match_strategy": "exact"
+    },
+    "segment_avg_kmer_mut": {
+      "loading": "eager",
+      "type": "hdf5",
+      "path": "/public3/home/songhui/data/.../wg.2mer_radius7_avg_mut.h5",
+      "match_strategy": "nearest",
+      "max_distance": 1000
+    },
+    "local_feature": {
+      "loading": "eager",
+      "type": "computed",
+      "compute_fn": "local_feature",
+      "params": {
+        "local_radius": 7,
+        "local_order": 3,
+        "names": ["local_seq", "cat_x", "mut_type"]
+      }
+    },
+    "distal_x": {
+      "loading": "lazy",
+      "type": "computed",
+      "compute_fn": "distal_encoding",
+      "params": {
+        "distal_radius": 1000,
+        "order": 1,
+        "encoding_type": "ohe"
+      }
+    }
+  },
+"features_without_train": ["local_seq"]
+}

@@ -5,9 +5,6 @@ Code for training models with RayTune
 import warnings
 warnings.filterwarnings('ignore',category=FutureWarning)
 
-
-from pybedtools import BedTool
-
 import sys
 import argparse
 import pandas as pd
@@ -145,38 +142,11 @@ def parse_arguments(parser):
                           folders. Default: False.
                           """ ).strip())
 
-    data_args.add_argument('--path_type', type=str, default=None, 
-                          help=textwrap.dedent("""
-                          specify dirpath used to avg mutation computation. Default: None.
-                          <s10M, half_1in2000_train>
-                          """ ).strip())
-
-    data_args.add_argument('--sliding_strategy', type=str, default=None, 
-                          help=textwrap.dedent("""
-                          specify dirpath used to avg mutation computation. Default: None.
-                          <window50k_step10k_prob1to3, window50k_step1k_prob1to3>
-                          """ ).strip())
-
-    data_args.add_argument('--step_avg_strategy', type=str, default=None, 
-                          help=textwrap.dedent("""
-                          specify dirpath used to step avg mutation computation. Default: None.
-                          """ ).strip())
-
-    data_args.add_argument('--use_segment_length_config', type=str, default=None, 
-                          help=textwrap.dedent("""
-                          specify segment length config, default: None.
-                          <kmer500k_avg50k>
-                          """ ).strip())
-
-    data_args.add_argument(
-        '--shuffle',
-        default=1,
-        type=str,
-        help=textwrap.dedent("""
-            Whether to shuffle the data during training.
-            Default: True
-        """).strip()
-    )
+    data_args.add_argument('--feature_config', default=None, type=str, help=textwrap.dedent("""
+                          Path to the JSON file containing feature configuration.
+                          Default: None
+                          """).strip()
+                          )
 
 
     model_args.add_argument(
@@ -469,8 +439,6 @@ def parse_arguments(parser):
 def main():
     
     #parse the command line
-    #parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
-    #parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
                                      description="""
     Overview

@@ -530,63 +530,113 @@ def prepare_local_data(bed_regions, ref_genome, bw_files, bw_names, bw_radii, ce
 
     return data_local, seq_cols, categorical_features, output_feature
 
-def prepare_local_datav2(bed_regions,ref_genome, bw_files, bw_names, bw_radii, central_bp, local_radius, local_order, seq_only):
+# def prepare_local_datav2(bed_regions,ref_genome, bw_files, bw_names, bw_radii, central_bp, local_radius, local_order, seq_only):
 
-    bed_generator = bed_reader(bed_regions, central_bp)
-    seqs_information_generator = seq_generator(bed_generator, ref_records=ref_genome, local_radius=local_radius)
+#     bed_generator = bed_reader(bed_regions, central_bp)
+#     seqs_information_generator = seq_generator(bed_generator, ref_records=ref_genome, local_radius=local_radius)
+#     y = []
+#     local_seq_cat = []
+#     local_seq_cat2 = []
+
+#     bw_data = []
+#     # Check if bigWig data should be used
+#     use_bigwig = len(bw_files) > 0 and not seq_only
+
+#     for long_seq, seqs, label in seqs_information_generator:
+#         sample_number = len(label)
+#         local_seq_cat_by_region = kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius=local_radius, local_order=1)
+#         local_seq_cat.append(local_seq_cat_by_region)
+        
+#         if local_order > 1:
+#             local_seq_cat_by_region = kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius=local_radius, local_order=local_order)
+#             local_seq_cat2.append(local_seq_cat_by_region)
+#         if use_bigwig:
+#             bw_data_by_region = get_local_bw_data_by_region(bw_files=bw_files, bw_radii=bw_radii, bw_names=bw_names,sample_number=sample_number, seqs=seqs)
+#             bw_data.append(bw_data_by_region)
+
+#         y.append(pd.DataFrame(label.reshape((-1,1)),columns = ['mut_type']))
+    
+#     if local_seq_cat:
+#         local_seq_cat = pd.concat(local_seq_cat, keys=range(len(local_seq_cat)))
+#         seq_cols = ['us'+str(local_radius - i) for i in range(local_radius)] + ['mid'] + ['ds'+str(i+1) for i in range(local_radius)]
+#     else:
+#         raise ValueError("local_seq_cat is empty. Ensure that sequences are being generated correctly.")
+
+#     if local_seq_cat2:
+#         cat_n = local_radius*2 +1 - (local_order-1)
+#         categorical_features  = ['cat'+str(i+1) for i in range(cat_n)]
+
+#         local_seq_cat2 = pd.concat(local_seq_cat2, keys=range(len(local_seq_cat2)))
+#         local_seq_cat2 = pd.concat([local_seq_cat, local_seq_cat2], axis=1)
+#     else:
+#         categorical_features = seq_cols
+
+#     print('local_seq_cat2 shape and columns:', local_seq_cat2.shape, local_seq_cat2.columns)
+#     print('categorical_features:', categorical_features)
+
+#     y = pd.concat(y, keys=range(len(y)))
+#     col_name_label = 'mut_type'
+
+#     # Add feature data in bigWig files
+#     # bug seq_only = false , concat multi Index dataframe and Index dataframe
+#     if bw_data:
+#         bw_data = pd.concat(bw_data, keys=range(len(bw_data)))
+#         # Use the mean value of the region of 2*radius+1 bp around the focal site
+#         data_local = pd.concat([local_seq_cat2, bw_data, y], axis=1)
+#     else:
+#         data_local = pd.concat([local_seq_cat2, y], axis=1)
+
+#     return data_local, seq_cols, categorical_features, col_name_label
+
+def prepare_local_feature(segments, ref_genome, local_radius, local_order, names=None):
+
+    # bed_generator = bed_reader(bed_regions, central_segment)
+    seqs_information_generator = seq_generator(segments, ref_records=ref_genome, local_radius=local_radius)
     y = []
-    local_seq_cat = []
-    local_seq_cat2 = []
+    local_seq = []
+    local_seq_encode = []
 
-    bw_data = []
     # Check if bigWig data should be used
-    use_bigwig = len(bw_files) > 0 and not seq_only
 
     for long_seq, seqs, label in seqs_information_generator:
         sample_number = len(label)
         local_seq_cat_by_region = kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius=local_radius, local_order=1)
-        local_seq_cat.append(local_seq_cat_by_region)
+        # .values : convert DF to np.array, backward compatibility with previous code
+        local_seq.append(local_seq_cat_by_region.values)
         
         if local_order > 1:
             local_seq_cat_by_region = kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius=local_radius, local_order=local_order)
-            local_seq_cat2.append(local_seq_cat_by_region)
-        if use_bigwig:
-            bw_data_by_region = get_local_bw_data_by_region(bw_files=bw_files, bw_radii=bw_radii, bw_names=bw_names,sample_number=sample_number, seqs=seqs)
-            bw_data.append(bw_data_by_region)
+            # .values : convert DF to np.array, backward compatibility with previous code
+            local_seq_encode.append(local_seq_cat_by_region.values)
 
-        y.append(pd.DataFrame(label.reshape((-1,1)),columns = ['mut_type']))
+        # y.append(pd.DataFrame(label.reshape((-1,1)),columns = ['mut_type']))
+        y.append(label)
     
-    if local_seq_cat:
-        local_seq_cat = pd.concat(local_seq_cat, keys=range(len(local_seq_cat)))
+    if local_seq:
         seq_cols = ['us'+str(local_radius - i) for i in range(local_radius)] + ['mid'] + ['ds'+str(i+1) for i in range(local_radius)]
+        local_seq = local_seq # (segment, sample_number, 2*local_radius+1), non-regular nested, each segment has different sample_number
     else:
-        raise ValueError("local_seq_cat is empty. Ensure that sequences are being generated correctly.")
+        raise ValueError("local_seq is empty. Ensure that sequences are being generated correctly.")
 
-    if local_seq_cat2:
+    if local_seq_encode:
         cat_n = local_radius*2 +1 - (local_order-1)
         categorical_features  = ['cat'+str(i+1) for i in range(cat_n)]
-
-        local_seq_cat2 = pd.concat(local_seq_cat2, keys=range(len(local_seq_cat2)))
-        local_seq_cat2 = pd.concat([local_seq_cat, local_seq_cat2], axis=1)
+        local_seq_encode = local_seq_encode # (segment, sample_number, cat_n), non-regular nested, each segment has different sample_number
     else:
         categorical_features = seq_cols
 
-    print('local_seq_cat2 shape and columns:', local_seq_cat2.shape, local_seq_cat2.columns)
+    print('segment number:', len(local_seq_encode))
     print('categorical_features:', categorical_features)
 
-    y = pd.concat(y, keys=range(len(y)))
-    col_name_label = 'mut_type'
+    # col_name_label = 'mut_type'
 
-    # Add feature data in bigWig files
-    # bug seq_only = false , concat multi Index dataframe and Index dataframe
-    if bw_data:
-        bw_data = pd.concat(bw_data, keys=range(len(bw_data)))
-        # Use the mean value of the region of 2*radius+1 bp around the focal site
-        data_local = pd.concat([local_seq_cat2, bw_data, y], axis=1)
-    else:
-        data_local = pd.concat([local_seq_cat2, y], axis=1)
-
-    return data_local, seq_cols, categorical_features, col_name_label
+    if names is None:
+        names = ['local_seq', 'local_seq_encode', 'mut_type']
+    return {
+        names[0]: local_seq,
+        names[1]: local_seq_encode,
+        names[2]: y,
+    }
 
 
 
@@ -1066,12 +1116,36 @@ class CombinedDatasetNP(Dataset):
     def _get_labels(self, dataset, idx):
         return dataset.__getitem__(idx)[1]
     
-def get_distal_seqs_by_region(bed_regions, seq_records, radius, central_bp):
+def get_distal_seqs_by_region(bed_regions, seq_records, radius, segment_center):
     seqs_list = []
     batch_shape = []
-    bed_generator = bed_reader(bed_regions, central_bp)
+    bed_generator = bed_reader(bed_regions, segment_center)
     init = False
     for batch,stand in bed_generator:
+        if not init:
+            chrom = batch[0].chrom
+            long_seq = str(seq_records[chrom].seq)
+            init = True
+        else:
+            if chrom != batch[0].chrom:
+                chrom = batch[0].chrom
+                long_seq = str(seq_records[chrom].seq)
+
+        # Create an array to store batch after ohe encoding
+       # batch_ohe_encoding = np.empty((len(batch),4,2*radius + 1), dtype='float32')
+                       
+        seqs = get_seqs_to_digitalized(long_seq, batch, radius, stand)
+        seqs_list.append([i for i in seqs])
+        batch_shape.append(len(batch))
+        #digit_seqs = get_encoding_seqs(long_seq, seqs, radius, encoding, local_order, batch_ohe_encoding)
+
+    return seqs_list,batch_shape
+
+def get_distal_seqs_by_segments(segments, seq_records, radius):
+    seqs_list = []
+    batch_shape = []
+    init = False
+    for batch,stand in segments:
         if not init:
             chrom = batch[0].chrom
             long_seq = str(seq_records[chrom].seq)

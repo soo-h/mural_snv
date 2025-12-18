@@ -26,14 +26,13 @@ def get_single_base_task_config(use_single_base_task):
     }
     return config_map.get(use_single_base_task, default_config)
 
-def compute_nuc_skew(bed_regions, segment_length, seq_record, radius_length, bin_size, cumulated=False):
+def compute_nuc_skew(segments, ref_genome, radius_length=8000, bin_size=1000, cumulated=False):
 
     single_base_info = {
         'nuc_skew': [],
     }
-    bed_generator = bed_reader(bed_regions, segment_length)
     chrom = None
-    for batch, stand in bed_generator:
+    for batch, stand in segments:
         if chrom != batch[0].chrom:
             chrom = batch[0].chrom
             long_seq = str(seq_record[chrom].seq)
@@ -41,7 +40,8 @@ def compute_nuc_skew(bed_regions, segment_length, seq_record, radius_length, bin
 
         nuc_skew = get_single_base_info_in_segment(batch, radius_length, length, long_seq, bin_size, cumulated)
         single_base_info['nuc_skew'].append(nuc_skew)
-    return single_base_info['nuc_skew']
+    # return single_base_info['nuc_skew']
+    return {'nuc_skew' : single_base_info}
 
 def get_single_base_info_in_segment(batch, radius_length, length, long_seq, bin_size, cumulated=False):
     S_value_list = []

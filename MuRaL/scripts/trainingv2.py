@@ -34,6 +34,7 @@ import os
 import time
 import datetime
 import random
+from typing import Dict, Any, Union
 
 from MuRaL.utils.printer_utils import get_printer
 from MuRaL.models.nn_models import *
@@ -50,6 +51,23 @@ from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
 
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor
 
+def read_feature_config(config_path: Union[str, Path]) -> Dict[str, Any]:
+    import json
+
+    config_path = Path(config_path)
+    
+    # 1. check if the file exists
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    # 2. read JSON
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON format in {config_path}: {e}")
+    
+    return config
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -57,28 +75,7 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def adapt_calc_loss_strategy(strategy):
-    if strategy == 'AvgSegMutUseInLocalv2':
-        return 'AvgSegMutUseInLocal'
-    return strategy
-def get_calc_segment_info_method(calc_strategy, print=print):
-    if calc_strategy == 'AvgSegmentLabel_withGAN' or calc_strategy == 'AvgSegmentLabel_withGAN2':
-        method = 'SegMut'
-    elif calc_strategy == 'AvgSegMutUseInLocal' or calc_strategy == 'AvgSegMutAndNucSkewUseInLocal':
-        method = 'SegMutRate'
-    elif calc_strategy == 'AvgSegAndKmerMut' or calc_strategy == 'AvgSegMutAndKmerMutUseInLocal':
-        method = 'AvgSegMutAndKmerMut'
-    elif calc_strategy == 'AvgSegMutUseInLocalv2':
-        method = 'SegMutRateByRegion'
-    elif calc_strategy == 'AvgStepMutAndKmerMutUseInLocal' or calc_strategy == 'AvgStepMutAndKmerMutCominedLoss':
-        method = 'AvgStepMutAndKmerMut'
-    elif calc_strategy == 'AvgStepMutUseInLocal':
-        method = 'AvgStepMut'
-    else:
-        method = None
-
-    print("Segment Info utils strategy: ", method)
-    return method
+def read_feature_config(feature_config_path):
 
 def train(config, args, checkpoint_dir=None):
     """
@@ -114,20 +111,21 @@ def train(config, args, checkpoint_dir=None):
         'n_h5_files' : args.n_h5_files,
         'without_bw_distal' : args.without_bw_distal,
         'bw_paths' : args.bw_paths,
-        'segment_length_config' : args.use_segment_length_config,
         'trial_dir' : args.trial_dir,
-        'slid_strategy' : args.sliding_strategy,
-        'step_avg_strategy': args.step_avg_strategy
     }
 
+    feature_config = read_feature_config(args.feature_config)
+    preprocess_config.update(feature_config)
+    # two sequence features must used: local and distal
+    use_segment_task = True if len(feature_config['features']) > 2 else False
+
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5, printer=print)
-    segment_calc_method = get_calc_segment_info_method(args.calc_loss_strategy_name, print=print)
     calc_loss_strategy_name = adapt_calc_loss_strategy(args.calc_loss_strategy_name)
-    print("single_base_task:", args.use_single_base_task)
-    dataset = preprocessor_pipline.preprocess_dataset(args.train_data, args.ref_genome, use_segment_task=args.use_segment_task, distal_encoding=args.distal_encoding, segment_calc_method=segment_calc_method, path_type=args.path_type, single_base_task=args.use_single_base_task)
+    # (2025.12.18 to do): 根据config中是否包含sequence外的feature决定segment task是True or False
+    dataset = preprocessor_pipline.preprocess_dataset(args.train_data, args.ref_genome, use_segment_task=use_segment_task)
 
     if args.validation_data:
-        dataset_valid = preprocessor_pipline.preprocess_dataset(args.validation_data, args.ref_genome, use_segment_task=args.use_segment_task, distal_encoding=args.distal_encoding, segment_calc_method=segment_calc_method, path_type=args.path_type, single_base_task=args.use_single_base_task)
+        dataset_valid = preprocessor_pipline.preprocess_dataset(args.validation_data, args.ref_genome, use_segment_task=use_segment_task)
         dataset_train = dataset
     else:
         print("Error: validation should provided.")
@@ -142,11 +140,11 @@ def train(config, args, checkpoint_dir=None):
     segment_workers = args.cpu_per_trial - 1
     #dataloader_train = generate_data_batches_v2(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True)
     segmentDatasetLoader_train = DataLoader(dataset_train, 1, shuffle=True, num_workers=segment_workers, pin_memory=False, collate_fn=dict_to_tuple_collate)
-    dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=args.use_segment_task)
+    dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=use_segment_task)
         
     #dataloader_valid = generate_data_batches_v2(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False)
     segmentDatasetLoader_valid = DataLoader(dataset_valid, 1, shuffle=False, num_workers=segment_workers, pin_memory=False, collate_fn=dict_to_tuple_collate)
-    dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=args.use_segment_task)
+    dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=use_segment_task)
 
     # get device
     device = torch.device('cpu')
@@ -161,12 +159,9 @@ def train(config, args, checkpoint_dir=None):
         else:    
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # model choice
     # model config
-    config['no_of_cont'] = len(dataset.cont_cols)
-    if calc_loss_strategy_name == 'AvgSegMutUseInLocal' or calc_loss_strategy_name == 'AvgSegMutAndNucSkewUseInLocal' or calc_loss_strategy_name == 'AvgSegMutAndKmerMutUseInLocal' or calc_loss_strategy_name == 'AvgStepMutAndKmerMutUseInLocal' \
-        or calc_loss_strategy_name == 'AvgStepMutUseInLocal':
-        config['no_of_cont'] += 3
+    # 2025.12.14, 当前该参数在model_factory中直接定义，后续考虑优化为自动生成或在config文件中定义
+    config['no_of_cont'] = None 
 
     emb_dims = [(x, min(16, int(x**0.25))) for x in dataset.cat_dims] 
     config['emb_dims'] = emb_dims 
@@ -185,6 +180,7 @@ def train(config, args, checkpoint_dir=None):
     model_factory = ModelFactory(config, args)
     model = model_factory.create_model(args.model_no)
 
+    # model choice
     if args.load_model_path:
         model_load(model, args.load_model_path, freeze=True, device=device)
     else:
@@ -290,8 +286,8 @@ def train(config, args, checkpoint_dir=None):
         print(f"Epoch {epoch} used time:{time.time()-epoch_time} seconds!")
         sys.stdout.flush()
 
-        dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=args.use_segment_task)
-        dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=args.use_segment_task)
+        dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=use_segment_task)
+        dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=use_segment_task)
 
 
     print(f"dital_radius: {args.distal_radius} training finish, {epoch} epochs total time:{time.time()-start_time} min!")
