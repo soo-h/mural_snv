@@ -5,6 +5,7 @@ warnings.filterwarnings('ignore',category=FutureWarning)
 
 
 from pybedtools import BedTool
+from pathlib import Path
 
 import sys
 sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
@@ -75,8 +76,6 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def read_feature_config(feature_config_path):
-
 def train(config, args, checkpoint_dir=None):
     """
     Training funtion.
@@ -120,7 +119,7 @@ def train(config, args, checkpoint_dir=None):
     use_segment_task = True if len(feature_config['features']) > 2 else False
 
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5, printer=print)
-    calc_loss_strategy_name = adapt_calc_loss_strategy(args.calc_loss_strategy_name)
+    calc_loss_strategy_name = "AvgSegMutUseInLocal" if args.calc_loss_strategy_name is not None else args.calc_loss_strategy_name
     # (2025.12.18 to do): 根据config中是否包含sequence外的feature决定segment task是True or False
     dataset = preprocessor_pipline.preprocess_dataset(args.train_data, args.ref_genome, use_segment_task=use_segment_task)
 
