@@ -21,17 +21,17 @@ from pathlib import Path
 import numpy as np
 
 
-def prepare_dataset_npv3(segments, ref_genome,  **kwargs):
+def prepare_dataset_npv3(segments, ref_genome, config):
 
     # Prepare local data
     ref_genome = SeqIO.to_dict(SeqIO.parse(open(ref_genome, 'r'), 'fasta'))
-    features = FeatureFactory(segments, ref_genome, kwargs['config']).create_all()
+    features = FeatureFactory(segments, ref_genome, config).create_all()
 
     # Combine local data and distal into Dataset objects  
     dataset = CombinedDatasetNPv2(
         segments=segments, 
         features = features,
-        features_without_train = kwargs['config'].get('features_without_train', ['local_seq']),
+        features_without_train = config.get('features_without_train', ['local_seq']),
         )
 
     return dataset
@@ -159,6 +159,9 @@ class FeatureFactory:
             raise ValueError(f"Unknown match strategy '{match_strategy}' for feature '{name}'")
 
         feature = load_hd5_features(self.segments, path, match_strategy)
+        if name == 'segment_avg_kmer_mut':
+            n_mut_class = config.get('n_mut_class', 3)
+            feature = [f.reshape(-1,14,n_mut_class,4) for f in feature]
         return {name: PrecomputedFeatureSource(feature)}
     
     def _create_computed_feature(self, name: str, config: Dict[str, Any]):
@@ -380,7 +383,7 @@ class DatasetPreprocessor:
         if self.use_h5:
             return self._process_h5(bed, ref_genome, bw_files, bw_names, bw_radii, use_segment_task)
         else:
-            return self._process_np(bed_regions, ref_genome, self.config)
+            return self._process_np(bed_regions, ref_genome)
 
     def _process_h5(self, bed_file, ref_genome, bw_files, bw_names, bw_radii, use_segment_task):
         # H5 specific logic
@@ -400,11 +403,11 @@ class DatasetPreprocessor:
         return dataset
 
 
-    def _process_np(self, bed_regions, ref_genome, config):
+    def _process_np(self, bed_regions, ref_genome):
         # Non-H5 logic
         self.printer('using numpy/pandas for distal_seq ...')
         step_stime = time.time()
-        dataset, segment_task = prepare_dataset_npv3(bed_regions, ref_genome, self.config)
+        dataset = prepare_dataset_npv3(bed_regions, ref_genome, config=self.config)
 
         #if segment_task and not prediction:
             #self._save_segment_task(segment_task, self.config['trial_dir'])

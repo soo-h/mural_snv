@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
-from model_config import model_choice
+from model_config import ModelFactory
 
 
 import pandas as pd
@@ -32,16 +32,16 @@ from MuRaL.evaluation.evaluation import *
 from MuRaL._version import __version__
 
 # from MuRaL.custom_dataloader import MyDataLoader
-from MuRaL.data.preprocessing import prepare_dataset_np, get_position_info, generate_data_batches, to_np, prepare_dataset_h5
+from MuRaL.data.preprocessing import get_position_info, generate_data_batches, to_np
 from MuRaL.data.data_preprocess_pipeline import DatasetPreprocessor
+from MuRaL.data.dataset import dict_to_tuple_collate
 from pynvml import *
 
 from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory
-from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
-from MuRaL.evaluation.observer import TimeMinor, GradMinor, LossMinor
-from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
-from MuRaL.training.predict import Predictor
-from MuRaL.scripts.trainingv2 import get_calc_segment_info_method, adapt_calc_loss_strategy
+from MuRaL.evaluation.observer import TimeMinor, LossMinor
+from MuRaL.training.predict import Predictor, BayesianPredictor
+
+from MuRaL.utils.config_utils import read_bnn_config, read_feature_config
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -54,6 +54,7 @@ def parse_arguments(parser):
     """ 
     optional = parser._action_groups.pop()
     required = parser.add_argument_group('Required arguments')
+    Bayes_args = parser.add_argument_group('Bayes-related arguments')
     optional.title = 'Other arguments' 
     
     required.add_argument('--ref_genome', type=str, metavar='FILE', default='',  
@@ -73,12 +74,6 @@ def parse_arguments(parser):
                           help=textwrap.dedent("""
                           File path for the configurations of the trained model.
                           """ ).strip()) 
-    optional.add_argument('--use_segment_task', 
-                            default=False,
-                            action = 'store_true',
-                            help=textwrap.dedent("""
-                            Use segment Information as aux task.
-                            """).strip())
                             
     optional.add_argument('--distal_encoding', 
                             type=str,
@@ -121,10 +116,6 @@ def parse_arguments(parser):
                           help=textwrap.dedent("""
                           Check pred time of each part. Default: False.
                           """).strip())
-    optional.add_argument('--path_type', type=str, default=None,
-                          help=textwrap.dedent("""
-                          specify the dir path used to avg mutation computation. Default: None.
-                          """).strip())   
 
     optional.add_argument('--use_single_base_task', 
                             nargs='?',
@@ -147,16 +138,6 @@ def parse_arguments(parser):
                     help=textwrap.dedent("""
                     Out each model prediction result.""").strip())
 
-    optional.add_argument('--sliding_strategy', type=str, default=None, 
-                          help=textwrap.dedent("""
-                          specify dirpath used to avg mutation computation. Default: None.
-                          <window50k_step10k_prob1to3, window50k_step1k_prob1to3>
-                          """ ).strip())
-
-    optional.add_argument('--step_avg_strategy', type=str, default=None, 
-                          help=textwrap.dedent("""
-                          specify dirpath used to step avg mutation computation. Default: None.
-                          """ ).strip())
 
     optional.add_argument('--cpu_only', default=False, action='store_true',  
                           help=textwrap.dedent("""
@@ -173,11 +154,6 @@ def parse_arguments(parser):
                           The maximum encoding unit of the sequence. It affects trade-off 
                           between RAM memory and preprocessing speed. It is recommended to use 300k.
                           Default: 300000.""" ).strip())
-
-    optional.add_argument('--avgmut_segment_center', type=int, metavar='INT', default=500000,
-                          help=textwrap.dedent("""
-                          The segment length used to calculate the average mutation rate.
-                          Default: 500000.""" ).strip())
 
     optional.add_argument('--pred_batch_size', type=int, metavar='INT', default=16, 
                           help=textwrap.dedent("""
@@ -204,6 +180,21 @@ def parse_arguments(parser):
     
     optional.add_argument('-v', '--version', action='version',
                         version='%(prog)s {}'.format(__version__))
+
+    optional.add_argument('--feature_config', default=None, type=str, help=textwrap.dedent("""
+                          Path to the JSON file containing feature configuration.
+                          Default: None
+                          """).strip()
+                          )
+
+    Bayes_args.add_argument('--use_bayesian', default=False, action='store_true',
+                          help=textwrap.dedent("""
+                          Use Bayesian model. Default: False.
+                          """ ).strip())
+    Bayes_args.add_argument("--bnn_config", default=None, type=str, help=textwrap.dedent("""
+                          Path to the JSON file containing Bayesian model configuration. Default: None
+                          """).strip()
+                          )
     
     parser._action_groups.append(optional)
     
@@ -270,19 +261,10 @@ def main():
     use_dilation = args.use_dilation
     set_torch_backends(use_dilation)
 
-    # Set input file
-    test_file = args.test_data   
-    ref_genome= args.ref_genome
-
     pred_batch_size = args.pred_batch_size
     sampled_segments = 1
     # Output file path
     pred_file = args.pred_file
-    
-    # Whether to generate H5 file for distal data
-    with_h5 = args.with_h5
-    n_h5_files = args.n_h5_files
-    h5f_path = args.h5f_path
     cpu_only = args.cpu_only
 
     # Get saved model-related files
@@ -300,28 +282,24 @@ def main():
     else:
         print('Error: no model config file provided!')
         sys.exit()
-        
+
+
+
     # Set hyperparameters
-    local_radius = config['local_radius']
-    local_order = config['local_order']
-    local_hidden1_size = config['local_hidden1_size']
-    local_hidden2_size = config['local_hidden2_size']
-    distal_radius = config['distal_radius']
-    distal_order = 1 # reserved for future improvement
-    CNN_kernel_size = config['CNN_kernel_size']  
-    CNN_out_channels = config['CNN_out_channels']
-    emb_dropout = config['emb_dropout']
-    local_dropout = config['local_dropout']
-    distal_fc_dropout = config['distal_fc_dropout']
-    emb_dims = config['emb_dims']
-    
+    if not config.get('distal_order'):
+        config['distal_order'] = args.distal_order
+    if 'without_bw_distal' not in config:
+        config['without_bw_distal'] = False
+    without_bw_distal = False 
     n_class = config['n_class']
-    model_no = config['model_no']
-    if 'without_bw_distal' in config: 
-        without_bw_distal = config['without_bw_distal']
-    else:
-        without_bw_distal = False
-    print(without_bw_distal)
+    print("without_bw_distal: ", without_bw_distal)
+
+    if args.use_bayesian:
+        # dependency bayesian modules
+        from bayesian_torch.models.dnn_to_bnn import dnn_to_bnn
+        # compatibility check and read config
+        assert int(config['model_no']) == 127 , "Only model_no 127 (MuRaL_Hybrid) is supported for Bayesian training currently."
+        const_bnn_prior_parameters = read_bnn_config(args.bnn_config)
     
     # set segment_center   
     if not args.segment_center:
@@ -329,8 +307,6 @@ def main():
     else:
         segment_center = args.segment_center
     
-    seq_only = config['seq_only']
-    # custom_dataloader = args.custom_dataloader
     # Print command line
     cuda_id = args.cuda_id
     print(' '.join(sys.argv))
@@ -343,80 +319,38 @@ def main():
     print('Start time:', datetime.datetime.now())
     sys.stdout.flush()
     
-    # Read BED files
-    test_bed = BedTool(test_file)
-
-    # Read bigWig file names
-    bw_paths = args.bw_paths
-    bw_files = []
-    bw_names = []
-    bw_radii = []
-    
-    if bw_paths:
-        try:
-            bw_list = pd.read_table(bw_paths, sep='\s+', header=None, comment='#')
-            bw_files = list(bw_list[0])
-            bw_names = list(bw_list[1])
-            if bw_list.shape[1]>2:
-                bw_radii = list(bw_list[2].astype(int))
-            else:
-                bw_radii = [local_radius]*len(bw_files)
-            seq_only = False
-        except pd.errors.EmptyDataError:
-            print('Warnings: no bigWig files provided in', bw_paths)
-            seq_only = True
-    else:
-        print('NOTE: no bigWig files provided.')
-        seq_only = True
-    
-
     mix_loss = config.get('mix_loss')
-    
-    step_avg_strategy = config.get('step_avg_strategy')
-    if step_avg_strategy:
-        if args.step_avg_strategy and args.step_avg_strategy != step_avg_strategy:
-            print(f'Warning: step_avg_strategy is different between config and command line. Using command line value: {args.step_avg_strategy}')
-        else:
-            args.step_avg_strategy = step_avg_strategy
-
-    sliding_strategy = config.get('sliding_strategy')
-    if sliding_strategy:
-        if args.sliding_strategy and args.sliding_strategy != sliding_strategy:
-            print(f'Warning: sliding_strategy is different between config and command line. Using command line value: {args.sliding_strategy}')
-        else:
-            args.sliding_strategy = sliding_strategy
     
     preprocess_config = {
         'segment_center': segment_center,
-        'segment_info_length': args.avgmut_segment_center,
         'local_radius' : config['local_radius'],
         'local_order' : config['local_order'],
         'distal_radius' : config['distal_radius'],
-        'distal_order' : args.distal_order,
+        'distal_order' : config['distal_order'],
         'h5f_path' : args.h5f_path,
-        'seq_only' : seq_only,
+        'seq_only' : config['seq_only'],
         'n_h5_files' : args.n_h5_files,
         'without_bw_distal' : without_bw_distal,
         'bw_paths' : args.bw_paths,
-        'slid_strategy' : args.sliding_strategy,
-        'step_avg_strategy': args.step_avg_strategy
     }
+
     for k,v in preprocess_config.items():
         print("{0}: {1}".format(k,v))
 
-    if args.use_segment_task:
-        assert preprocess_config['segment_info_length'] % preprocess_config['segment_center'] == 0, 'segment_info_length should be multiple of segment_center'
+    feature_config = read_feature_config(args.feature_config)
+    use_segment_task = True if len(feature_config['features']) > 2 else False
+    print("use_segment_task:", use_segment_task)
 
-    segment_calc_method = get_calc_segment_info_method(args.calc_loss_strategy_name, print=print)
-    calc_loss_strategy_name = adapt_calc_loss_strategy(args.calc_loss_strategy_name)
-    single_base_task = args.use_single_base_task
+    preprocess_config.update(feature_config)
+
+
+    calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is not None else args.calc_loss_strategy_name
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5)
-    dataset_test = preprocessor_pipline.preprocess_dataset(args.test_data, args.ref_genome, use_segment_task=args.use_segment_task, distal_encoding=args.distal_encoding, segment_calc_method=segment_calc_method, path_type=args.path_type, prediction=True, single_base_task=single_base_task)
+    dataset_test = preprocessor_pipline.preprocess_dataset(args.test_data, args.ref_genome, use_segment_task=use_segment_task)
+    segmentLoader_test = DataLoader(dataset_test, 1, shuffle=False, pin_memory=False,  collate_fn=dict_to_tuple_collate)
+    dataloader= generate_data_batches(segmentLoader_test, sampled_segments, pred_batch_size, shuffle=False, use_segment_task=use_segment_task)
 
     data_local_test = dataset_test.data_local.reset_index(drop=True)
-
-    n_cont = len(dataset_test.cont_cols)
-    
     sys.stdout.flush()
     
     if cpu_only:
@@ -431,37 +365,17 @@ def main():
             print('using'  , 'cuda:'+cuda_id)
         device = torch.device('cuda:'+cuda_id if torch.cuda.is_available() else 'cpu')
         torch.cuda.set_device(f'cuda:{cuda_id}')
-    #####
-    if without_bw_distal:
-        in_channels = 4**distal_order
-    else:
-        in_channels = 4**distal_order+n_cont
-    #####
 
-    # Choose the network model
-    if model_no == 0:
-        model = Network0(emb_dims, no_of_cont=n_cont, lin_layer_sizes=[local_hidden1_size, local_hidden2_size], emb_dropout=emb_dropout, lin_layer_dropouts=[local_dropout, local_dropout], n_class=n_class, emb_padding_idx=4**local_order).to(device)
-    elif model_no == 1:
-        model = Network1(in_channels=in_channels, out_channels=CNN_out_channels, kernel_size=CNN_kernel_size, distal_radius=distal_radius, distal_order=distal_order, distal_fc_dropout=distal_fc_dropout, n_class=n_class).to(device)
-    elif model_no == 2:
-        model = Network2(emb_dims, no_of_cont=n_cont, lin_layer_sizes=[local_hidden1_size, local_hidden2_size], emb_dropout=emb_dropout, lin_layer_dropouts=[local_dropout, local_dropout], in_channels=in_channels, out_channels=CNN_out_channels, kernel_size=CNN_kernel_size, distal_radius=distal_radius, distal_order=distal_order, distal_fc_dropout=distal_fc_dropout, n_class=n_class, emb_padding_idx=4**local_order).to(device)
-    elif model_no == 3:
-        model = Network3(emb_dims, no_of_cont=n_cont, lin_layer_sizes=[local_hidden1_size, local_hidden2_size], emb_dropout=emb_dropout, lin_layer_dropouts=[local_dropout, local_dropout], in_channels=in_channels, out_channels=CNN_out_channels, kernel_size=CNN_kernel_size, distal_radius=distal_radius, distal_order=distal_order, distal_fc_dropout=distal_fc_dropout, n_class=n_class, emb_padding_idx=4**local_order).to(device)
-    else:
-        model = model_choice(model_no, config, emb_dims, distal_order, n_class, n_cont, in_channels)
-        #print('Error: no model selected!')
-        #sys.exit() 
 
-    model.to(device)
-    print('model:')
-    print(model)
+    # model config
+    # 2025.12.14, 当前该参数在model_factory中直接定义，后续考虑优化为自动生成或在config文件中定义
+    model_factory = ModelFactory(config, args)
+    model = model_factory.create_model(config['model_no'])
 
-    # Load the saved model object
     model_state = torch.load(model_path, map_location=device)
-    model.load_state_dict(model_state)
-    
-    del model_state
-    torch.cuda.empty_cache() 
+
+
+
 
     # Loss function
     criterion = torch.nn.CrossEntropyLoss(reduction='sum')
@@ -469,26 +383,34 @@ def main():
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=mix_loss)
 
     # Set prob names for mutation types
-    prob_names = ['prob'+str(i) for i in range(n_class)]
 
-    # Dataloader for testing data    
-    # if custom_dataloader:
-        # dataloader = MyDataLoader(dataset_test, sampled_segments, batch_size2=pred_batch_size, shuffle=False, shuffle2=False, num_workers=0, pin_memory=False)   
-    
-    segmentLoader_test = DataLoader(dataset_test, 1, shuffle=False, pin_memory=False)
-    dataloader= generate_data_batches(segmentLoader_test, sampled_segments, pred_batch_size, shuffle=False, use_segment_task=args.use_segment_task)
-        
     Observer = [TimeMinor(out_after_n_batch=1000), 
                 LossMinor(calc_loss_strategy_name, printer=print)]
 
-    detach = False
-    if model_no in [50, 51, 52, 53, 54]:
-        detach = True
-    predictor = Predictor(model, loss_calculator, criterion, device, config, 
-                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name, detach=detach)
+    if args.use_bayesian:
+        config.update(const_bnn_prior_parameters)
+        dnn_to_bnn(model, const_bnn_prior_parameters)
+        # Load the saved model object
+        model.load_state_dict(model_state)
+        model.to(device)
+        predictor = BayesianPredictor(model, loss_calculator, criterion, device, config, 
+                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
+    else:
+        model.load_state_dict(model_state)
+        model.to(device)
+        predictor = Predictor(model, loss_calculator, criterion, device, config, 
+                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
+
+    print('model:')
+    print(model)
+    del model_state
+    torch.cuda.empty_cache() 
     
 
+    prob_names = ['prob'+str(i) for i in range(n_class)]
+
     if out_each_model_preds:
+        assert args.use_bayesian == False, "args.use_bayesian must be True when out_each_model_preds is False"
         pred_dict = predictor.predict_each_model(dataloader)
         out_each_model_preds = [
             pd.DataFrame(
@@ -498,7 +420,7 @@ def main():
                 for name, preds in pred_dict.items() if name != 'out'
                 ]
         out_each_model_preds = pd.concat(out_each_model_preds, axis=1)
-        chr_pos_ = get_position_info(test_bed, segment_center)
+        chr_pos_ = get_position_info(BedTool(args.test_data), segment_center)
         chr_pos_.columns = ['chrom', 'start', 'end', 'strand']
         mut_type = data_local_test['mut_type']
         out_each_model_preds = pd.concat([chr_pos_, mut_type, out_each_model_preds], axis=1)
@@ -508,15 +430,31 @@ def main():
         out_each_model_preds.to_csv(pred_file_each_model, sep='\t', float_format='%.4g', index=False)
 
         pred_y = pred_dict['out']
+        y_prob = pd.DataFrame(data=to_np(F.softmax(pred_y, dim=1)), columns=prob_names)
+
+        dfs = [data_local_test, y_prob]
     else:
-        pred_y = predictor.predict(dataloader)
-    # Print some data for debugging
-    print('pred_y:', F.softmax(pred_y[1:10], dim=1))
-    for i in range(1, n_class):
-        print('min and max of pred_y: type', i, np.min(to_np(F.softmax(pred_y, dim=1))[:,i]), np.max(to_np(F.softmax(pred_y, dim=1))[:,i]))
+        if args.use_bayesian:
+            pred_y, pred_y_std = predictor.predict(dataloader)
+            y_prob = pd.DataFrame(data=to_np(pred_y), columns=prob_names)
+            prob_std_names = ['prob_std' + str(i) for i in range(n_class)]
+            pred_y_std = pd.DataFrame(data=to_np(pred_y_std), columns=prob_std_names)
+            all_prob_names = prob_names + prob_std_names
+            dfs = [data_local_test, y_prob, pred_y_std]
+
+            print('pred_y:', pred_y[1:10])
+            print('pred_y_std:', pred_y_std[1:10])
+        else:
+            pred_y = predictor.predict(dataloader)
+            print('pred_y:', F.softmax(pred_y[1:10], dim=1))
+            y_prob = pd.DataFrame(data=to_np(F.softmax(pred_y, dim=1)), columns=prob_names)
+            all_prob_names = prob_names
+            dfs = [data_local_test, y_prob]
+            # Print some data for debugging
+            for i in range(1, n_class):
+                print('min and max of pred_y: type', i, np.min(to_np(F.softmax(pred_y, dim=1))[:,i]), np.max(to_np(F.softmax(pred_y, dim=1))[:,i]))
         
     # Get the predicted probabilities, as the returns of model are logits    
-    y_prob = pd.DataFrame(data=to_np(F.softmax(pred_y, dim=1)), columns=prob_names)
     
     # Do probability calibration using saved calibrator
     if calibrator_path != '':
@@ -527,13 +465,15 @@ def main():
             y_prob = pd.DataFrame(data=np.copy(prob_cal), columns=prob_names)
 
     # Combine data 
-    data_and_prob = pd.concat([data_local_test, y_prob], axis=1)         
+    cols = ['mut_type'] + all_prob_names
+
+    data_and_prob = pd.concat(dfs, axis=1)
+    test_pred_df = data_and_prob[cols]
 
     # Write the prediction
-    test_pred_df = data_and_prob[['mut_type'] + prob_names]
-    chr_pos = get_position_info(test_bed, segment_center)
+    chr_pos = get_position_info(BedTool(args.test_data), segment_center)
     pred_df = pd.concat((chr_pos, test_pred_df), axis=1)
-    pred_df.columns = ['chrom', 'start', 'end', 'strand', 'mut_type'] +  prob_names
+    pred_df.columns = ['chrom', 'start', 'end', 'strand'] +  cols
     pred_df.sort_values(['chrom', 'start'], inplace=True)
     pred_df.reset_index(drop=True, inplace=True)
     pred_df.to_csv(pred_file, sep='\t', float_format='%.4g', index=False)

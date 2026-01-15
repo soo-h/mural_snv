@@ -1,73 +1,43 @@
-import warnings
-
-import torch.backends
-warnings.filterwarnings('ignore',category=FutureWarning)
-
-
-from pybedtools import BedTool
-from pathlib import Path
-
-import sys
-sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
-from model_config import ModelFactory
-
-from MuRaL.data.data_preprocess_pipeline import DatasetPreprocessor
-
-import argparse
-import pandas as pd
-import numpy as np
-import pickle
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.utils.data import random_split
-
-
-from functools import partial
-import ray
-from ray import tune
-from ray.tune import CLIReporter
-from ray.tune.schedulers import ASHAScheduler
-
 import os
+import sys
 import time
-import datetime
 import random
+import warnings
 from typing import Dict, Any, Union
 
+import json
+import pickle
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from ray import tune
+
+from pybedtools import BedTool
+
+from scipy.stats import pearsonr
+
+
+from MuRaL.data.data_preprocess_pipeline import DatasetPreprocessor
 from MuRaL.utils.printer_utils import get_printer
 from MuRaL.models.nn_models import *
 from MuRaL.models.nn_utils import *
 from MuRaL.evaluation.evaluation import *
-from MuRaL.data.custom_dataloader import MyDataLoader
 from MuRaL.data.preprocessing import *
 from MuRaL.data.dataset import dict_to_tuple_collate
-
 from MuRaL.models.custom_loss import *
 from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
 from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
-
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor
+from MuRaL.utils.config_utils import read_bnn_config, read_feature_config
 
-def read_feature_config(config_path: Union[str, Path]) -> Dict[str, Any]:
-    import json
+sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
+from model_config import ModelFactory
 
-    config_path = Path(config_path)
-    
-    # 1. check if the file exists
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    # 2. read JSON
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON format in {config_path}: {e}")
-    
-    return config
+warnings.filterwarnings('ignore',category=FutureWarning)
 
 def set_seed(seed):
     random.seed(seed)
@@ -85,6 +55,19 @@ def train(config, args, checkpoint_dir=None):
         args: input args from the command line
         checkpoint_dir: checkpoint dir
     """
+
+    ## bayesian model
+    if args.use_bayesian:
+        # dependency bayesian modules
+        from bayesian_torch.models.dnn_to_bnn import dnn_to_bnn, get_kl_loss
+        from bayesian_torch.ao.quantization.quantize import enable_prepare, convert
+        from bayesian_torch.models.bnn_to_qbnn import bnn_to_qbnn
+        # compatibility check and read config
+        assert int(args.model_no) in [127, 129, 132] , "Only model_no 127 (MuRaL_Hybrid) is supported for Bayesian training currently."
+        const_bnn_prior_parameters = read_bnn_config(args.bnn_config)
+        moped_enable = True if args.load_model_path else False
+        const_bnn_prior_parameters['moped_enable'] = moped_enable
+
 
     start_time = time.time()
     args.segment_task = None
@@ -114,12 +97,13 @@ def train(config, args, checkpoint_dir=None):
     }
 
     feature_config = read_feature_config(args.feature_config)
-    preprocess_config.update(feature_config)
     # two sequence features must used: local and distal
     use_segment_task = True if len(feature_config['features']) > 2 else False
+    print("use_segment_task:", use_segment_task)
 
+    preprocess_config.update(feature_config)
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5, printer=print)
-    calc_loss_strategy_name = "AvgSegMutUseInLocal" if args.calc_loss_strategy_name is not None else args.calc_loss_strategy_name
+    calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is not None else args.calc_loss_strategy_name
     # (2025.12.18 to do): 根据config中是否包含sequence外的feature决定segment task是True or False
     dataset = preprocessor_pipline.preprocess_dataset(args.train_data, args.ref_genome, use_segment_task=use_segment_task)
 
@@ -159,17 +143,15 @@ def train(config, args, checkpoint_dir=None):
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # model config
-    # 2025.12.14, 当前该参数在model_factory中直接定义，后续考虑优化为自动生成或在config文件中定义
-    config['no_of_cont'] = None 
+    # 2025.1.4, 考虑优化为自动生成或在config文件中定义
+    config['no_of_cont'] = sum([feature.get('no_of_cont', 0) for f_name, feature in feature_config['features'].items()])
 
     emb_dims = [(x, min(16, int(x**0.25))) for x in dataset.cat_dims] 
     config['emb_dims'] = emb_dims 
     config['lin_layer_sizes']= [config['local_hidden1_size'], config['local_hidden2_size']]
     config['lin_layer_dropouts']=[config['local_dropout'], config['local_dropout']]
-    config['avg_mut_dropout'] = config['avg_mut_dropout']
     config['n_class']=n_class
     config['emb_padding_idx'] = 4**config['local_order']
-    config['n_class'] = n_class
     # other config
     config['model_no'] = args.model_no
     config['without_bw_distal'] = args.without_bw_distal
@@ -184,8 +166,8 @@ def train(config, args, checkpoint_dir=None):
         model_load(model, args.load_model_path, freeze=True, device=device)
     else:
         model.apply(weights_init)
-
-    model.to(device)
+    if not args.use_bayesian:
+        model.to(device)
     total_params = count_parameters(model)
     print("model:" )
     print(model)
@@ -208,8 +190,22 @@ def train(config, args, checkpoint_dir=None):
     Observer = [TimeMinor(out_after_n_batch=1000, printer=print), 
                 GradMinor(out_after_n_batch=1000, printer=print), 
                 LossMinor(calc_loss_strategy_name, printer=print)]
-    trainer = Trainer(model, optimizer, scheduler, loss_calculator, criterion, device, config, 
-                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
+
+    if args.use_bayesian:
+        from MuRaL.training.train import BayesianTrainer
+        config.update(const_bnn_prior_parameters)
+        config['kl_loss'] = get_kl_loss
+        config['kl_weight'] = args.kl_weight
+        # wrap DNN to BNN, only support liner and conv layers
+        dnn_to_bnn(model, const_bnn_prior_parameters)
+        model.to(device)
+        print("bnn model:" )
+        print(model)
+        trainer = BayesianTrainer(model, optimizer, scheduler, loss_calculator, criterion, device, config,
+                                  observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
+    else:
+        trainer = Trainer(model, optimizer, scheduler, loss_calculator, criterion, device, config, 
+                          observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
 
     if not args.use_ray:
         early_stopping = EarlyStopping(patience=args.grace_period, verbose=True)
@@ -220,13 +216,23 @@ def train(config, args, checkpoint_dir=None):
         save_path = get_save_path(args.use_ray, args.trial_dir, epoch)
 
         trainer.train_step(dataloader_train)
-        valid_pred_y = trainer.valid_step(dataloader_valid)
-        valid_y_prob = to_np(F.softmax(valid_pred_y, dim=1))
+        if args.use_bayesian:
+            valid_y_prob, valid_y_std = trainer.valid_step(dataloader_valid)
+            valid_y_prob = to_np(valid_y_prob)
+            print("valid_y_std 0:10 :", valid_y_std[:10])
+        
+        else:
+            valid_pred_y = trainer.valid_step(dataloader_valid)
+            valid_y_prob = to_np(F.softmax(valid_pred_y, dim=1))
         valid_y = data_local_valid['mut_type'].to_numpy().squeeze()
 
         # calibrate
         calibrator, fdiri_nll = calibrate_prob(valid_y_prob, valid_y, device, calibr_name='FullDiri')
         prob_cal = calibrator.predict_proba(valid_y_prob)
+
+        if n_class == 7:
+            n_sub = (7-1) // 2
+            report_ac_prob_correlation(valid_y_prob, n_class=n_class, n_sub=n_sub)
 
         # Evaluation- Kmer
         evaluator_before_calibra = Evaluator(data_local_valid, valid_y_prob, n_class, printer=print)
@@ -451,3 +457,31 @@ def report_metrics(metrics, report_path=None):
     else:
         for key, value in metrics.items():
             print(f"{key}: {value}")
+
+def report_ac_prob_correlation(valid_y_prob, n_class=7, n_sub=3):
+    """
+    Report correlation between AC=1 and AC>1 probabilities.
+
+    Assumes class layout:
+        [bg | AC=1 (n_sub) | AC>1 (n_sub)]
+    """
+    assert n_class == 1 + 2 * n_sub, \
+        f"Expect n_class={1 + 2 * n_sub}, got {n_class}"
+
+    ac1_start = 1
+    acgt_start = 1 + n_sub
+
+    # per-subtype correlation
+    for i in range(n_sub):
+        ac1_prob = valid_y_prob[:, ac1_start + i]
+        acgt_prob = valid_y_prob[:, acgt_start + i]
+
+        corr, _ = pearsonr(ac1_prob, acgt_prob)
+        print(f"AC=1 and AC>1 subtype {i+1} correlation: {corr:.4f}")
+
+    # summed correlation
+    ac1_sum = valid_y_prob[:, ac1_start:ac1_start + n_sub].sum(axis=1)
+    acgt_sum = valid_y_prob[:, acgt_start:acgt_start + n_sub].sum(axis=1)
+
+    corr, _ = pearsonr(ac1_sum, acgt_sum)
+    print(f"AC=1 and AC>1 probs sum correlation: {corr:.4f}")

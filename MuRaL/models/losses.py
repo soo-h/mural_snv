@@ -170,22 +170,59 @@ class AdaptiveLossStrategy2():
         loss_mid = criterion(mid, y) if mid is not None else None
 
         loss_distal = criterion(distal, y) if distal is not None else None
+
+        loss_dual_head = 0
+        if 'local_h1' in preds:
+            assert 'local_h2' in preds, "Both local_h1 and local_h2 should be present"
+            loss_local_h1 = criterion(preds['local_h1'], self._to_h1_label(y))
+            loss_local_h2 = criterion(preds['local_h2'], self._to_h2_label(y))
+            loss_dual_head = loss_local_h1 + loss_local_h2
+
         loss = criterion(out, y)
 
-        self.total_loss = loss
-        total_loss = loss
+        self.total_loss = loss + 0.25 * loss_dual_head
 
         return {'local_loss': loss_local1, 
                 'local2_loss' : loss_local2, 
                 'local3_loss' : loss_local3, 
                 'mid_loss' : loss_mid, 
                 'distal_loss' : loss_distal, 
-                'loss' : total_loss, 
-                }
+                'dual_head_loss' : loss_dual_head,
+                'loss' : self.total_loss} 
     
     def check_preds(self, preds):
         if not isinstance(preds, dict):
             sys.exit(f"Error: pred should be dict type, but input is {type(preds)}")
+
+    def _to_h1_label(self, y):
+        """
+        7-class → Head1
+        {0,4,5,6} → 0
+        """
+     # 显式映射表，消除所有条件分支
+        mapping = torch.tensor(
+            [0, 1, 2, 3, 0, 0, 0],
+            device=y.device,
+            dtype=y.dtype
+            )
+        return mapping[y]
+
+    def _to_h2_label(self, y):
+        """
+        7-class → Head2
+        {0,1,2,3} → 0
+        4 → 1
+        5 → 2
+        6 → 3
+        """
+     # 显式映射表，消除所有条件分支
+        mapping = torch.tensor(
+            [0, 0, 0, 0, 1, 2, 3],
+            device=y.device,
+            dtype=y.dtype
+            )
+        return mapping[y]
+
 
     def check_labels(self, labels):
         if not isinstance(labels, dict):

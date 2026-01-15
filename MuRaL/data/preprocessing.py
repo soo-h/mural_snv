@@ -1815,3 +1815,48 @@ def generate_data_batches_filt(dataset,
         train_number += 1
         yield y, cont_x, cat_x, distal_x
     print(f"total {batch_number} segment, drop {batch_number-train_number} segment")
+
+def get_expanded_region(start, stop, radius, model_type='snv'):
+    """
+    Calculate expanded genomic coordinates by radius 
+    
+    Args:
+        start: Region start position (0-based inclusive)
+        stop: Region end position (0-based inclusive)
+        radius: Number of bases to expand around the region
+        model_type: Either 'snv'  or 'indel' 
+    
+    Returns:
+        Tuple of (expanded_start, expanded_stop)
+    
+    Coordinate Expansion Diagrams:
+    
+    SNV Model (expand according to the sampled site):
+    segment: |-----|← radius →[sampled_site]← radius →|-----|
+    index:    start-radius  --[    start   ]--    start+radius+1
+    
+    Indel Model (expand according to the sampled gap):
+    segment: |----|← radius-1 →[start [   -----   ] stop]← radius-1 →|----|
+    index:   start-(radius-1)  [start [sampled_gap] stop]        stop+radius
+    
+    Examples:
+        >>> # SNV model, sampled site starts at 100.
+        >>> get_expanded_region(100, 101, 10, 'snv')
+        (90, 111)  # [90,130] contains original [100,120]
+        
+        >>> # Indel model, sampled gap between 100 and 120.
+        >>> get_expanded_region(100, 120, 10, 'indel')
+        (91, 130)  # [91,130] contains original [100,120]
+    """
+    return extend_interval(start, stop, radius, radius, model_type=model_type)
+
+
+def extend_interval(start, stop, left_radius, right_radius, model_type='snv'):
+    if model_type == 'snv':
+        start1 = start - left_radius
+        stop1 = stop + right_radius
+    # 0-base [left,right]
+    if model_type == 'indel':
+        start1 = start - left_radius + 1
+        stop1 = stop + right_radius # start + 1 + right_radius or stop-2 + right_radius
+    return start1, stop1

@@ -3,6 +3,7 @@ import time
 import sys
 
 import torch.nn as nn
+import torch.nn.functional as F
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, ContributionMinor, ContributionMinor2
 
 class TrainerSubject:
@@ -22,7 +23,7 @@ class TrainerSubject:
             if indicator:
                 self.metrics.update(indicator)
 
-class Trainer(TrainerSubject):
+class BayesianTrainer(TrainerSubject):
     def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print) -> None:
 
         super().__init__()
@@ -37,6 +38,13 @@ class Trainer(TrainerSubject):
         self.printer = printer
         self.train_strategy = train_strategy
         self.preds_adapter = AdaptPreds(self.config['model_no'], self.train_strategy)
+        self.model_train = model_train_register(self.train_strategy)
+        self.model_predict = model_train_register(self.train_strategy)
+        self.kl_loss = self.config['kl_loss']
+
+        # bayesian config
+        self.num_monte_carlo = self.config.get('num_monte_carlo', 10)
+        self.train_monte_carlo = self.config.get('train_monte_carlo', 10)
 
         if observer is None:
             self.observer = [TimeMinor(out_after_n_batch=1000), GradMinor(out_after_n_batch=2000), LossMinor()]
@@ -65,7 +73,182 @@ class Trainer(TrainerSubject):
 
             batch = self.load_to_device(batch, self.device)
             label, inputs = get_inputs_labels(batch, self.train_strategy)
-            preds = model_train(inputs, self.model, self.train_strategy)
+
+            # bayesian monte carlo
+            output_ = []
+            kl_ = []
+            for mc_run in range(int(self.train_monte_carlo)):
+                # preds is dict
+                preds = self.model_train(inputs, self.model)
+                # adapt preds to the loss calculator
+                preds = self.preds_adapter.adapt(preds)
+                kl = self.kl_loss(self.model)
+                kl_.append(kl)
+                output_.append(preds) # only check in model_no 127
+            output = self._merge_mc_outputs(output_, mode="mean")
+            kl = torch.mean(torch.stack(kl_), dim=0) / self.config['batch_size']
+
+            losses = self.LossCalculator.calc_loss(output, label, self.criterion)
+            loss = self.LossCalculator.extract_total_loss()
+            loss += kl  * self.config['kl_weight']
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10, error_if_nonfinite=False)
+            self.notify_observers(model=self.model)
+            self.optimizer.step()
+            batch_train_time = time.time() - time_tmp
+
+            # updata lr
+            self.update_lr()
+            batch_total_time = time.time() - batch_total_time
+            # record log
+            self.notify_observers(losses=losses, 
+                                  sample_number = sample_number,
+                                  batch_train_time=batch_train_time, 
+                                  batch_load_time=batch_load_time, 
+                                  batch_total_time=batch_total_time)
+            batch_total_time = time_tmp = time.time()
+        
+        self.notify_observers(train_step_finish = True)
+        self.update_lr()
+        sys.stdout.flush()
+
+    def valid_step(self, dataloader_valid):
+        self.register_observer(self.valid_preds_recoder)
+        self.register_observer(self.contribution_minor)
+        self.model.eval()
+        valid_step_time = time.time()
+
+        pred_y_ensemble = torch.empty(0, self.config['n_class']).to(self.device)
+        pred_y_uncertain = torch.empty(0, self.config['n_class']).to(self.device)
+
+        with torch.no_grad():
+            for batch in dataloader_valid:
+                batch = self.load_to_device(batch, self.device)
+                label, inputs = get_inputs_labels(batch, self.train_strategy)
+
+                pred_results = [] # used loss calc
+                output_mc = [] # used ensemble predict(mean) and uncertainty(std)
+                for mc_run in range(int(self.num_monte_carlo)):
+                    valid_preds = self.model_predict(inputs, self.model)
+                    valid_preds = self.preds_adapter.adapt(valid_preds)
+                    pred_results.append(valid_preds)
+                    final_pred = self._extract_final_pred(valid_preds)
+                    # ensemble, softmax first 
+                    output_mc.append(F.softmax(final_pred, dim=1))
+                pred_results = self._merge_mc_outputs(pred_results, mode="mean")
+                output_mc = torch.stack(output_mc)
+                means = output_mc.mean(axis=0)
+                stds = output_mc.std(axis=0)
+                pred_y_ensemble = torch.cat((pred_y_ensemble, means), dim=0)
+                pred_y_uncertain = torch.cat((pred_y_uncertain, stds), dim=0)
+
+
+                losses = self.LossCalculator.calc_loss(pred_results, label, self.criterion)
+                #valid_pred = self.LossCalculator.extract_pred(valid_preds)
+                sample_number = batch[0].shape[0]
+
+                self.notify_observers(losses = losses,
+                                      sample_number = sample_number,
+                                      valid_preds = valid_preds,
+                                      label = label)
+            
+            self.notify_observers(valid_step_finish = True)
+        valid_step_time = time.time() - valid_step_time
+        self.printer(f"Validation used time: {valid_step_time / 60} mins")
+        valid_preds = self.valid_preds_recoder.output()
+
+        self.remove_observer(self.valid_preds_recoder)
+        self.remove_observer(self.contribution_minor)
+        # return valid_preds
+        return pred_y_ensemble, pred_y_uncertain
+
+                
+
+    def update_lr(self):
+        if self.config['lr_scheduler'] != 'ROP':
+            self.scheduler.step()
+            if self.optimizer.param_groups[0]['lr'] < self.config['min_lr']:
+                self.printer("optimizer.param_groups[0]:", self.optimizer.param_groups[0]['lr'])
+                for g in self.optimizer.param_groups:
+                    g['lr'] = self.config['restart_lr']
+        if self.config['lr_scheduler'] == 'ROP':
+            self.scheduler.step(self.metrics['current_valid_loss'])
+
+    def load_to_device(self, batch, device):
+        if isinstance(batch, dict):
+            return {k: v.to(device) for k, v in batch.items()}
+        elif isinstance(batch, (tuple, list)):
+            return [v.to(device) for v in batch]
+        else:
+            return batch.to(device)
+    
+    def _merge_mc_outputs(self, outputs, mode="mean"):
+        if mode not in ["mean"]:
+            raise ValueError(f"mode {mode} not supported")
+        agg_fn = torch.mean
+        outputs = [o[0] for o in outputs if len(o) == 2] 
+        if isinstance(outputs[0], dict):
+            return {k: 
+                    agg_fn(torch.stack([o[k] for o in outputs]), dim=0) 
+                    for k in outputs[0].keys()}, None
+        elif isinstance(outputs[0], torch.Tensor):
+            return agg_fn(torch.stack(outputs), dim=0), None
+        
+    def _extract_final_pred(self, preds):
+        preds = preds[0] if len(preds) == 2 else preds
+        if isinstance(preds, dict):
+            return preds['out']
+        else:
+            assert isinstance(preds, torch.Tensor) , "preds must be a torch.Tensor or a dict with key 'out'"
+            return preds
+
+class Trainer(TrainerSubject):
+    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print) -> None:
+
+        super().__init__()
+
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.criterion = criterion
+        self.device = device
+        self.config = config
+        self.LossCalculator = loss_calculator
+        self.printer = printer
+        self.train_strategy = train_strategy
+        self.preds_adapter = AdaptPreds(self.config['model_no'], self.train_strategy)
+        self.model_train = model_train_register(self.train_strategy)
+        self.model_predict = model_train_register(self.train_strategy)
+
+        if observer is None:
+            self.observer = [TimeMinor(out_after_n_batch=1000), GradMinor(out_after_n_batch=2000), LossMinor()]
+        else:
+            self.observer = observer
+
+        for observer in self.observer:
+            self.register_observer(observer)
+        
+        self.valid_preds_recoder = PredsRecoder()
+        self.contribution_minor = ContributionMinor2(printer=printer)
+        self.metrics = {}
+
+    def train_step(self, data_loader):
+        self.model.train()
+        batch_total_time = time_tmp = time.time()
+        batch_count = 0
+        #for y, cont_x, cat_x, distal_x in data_loader:
+        for batch in data_loader:
+            batch_load_time = time.time() - time_tmp
+            batch_count += 1
+            sample_number = batch[0].shape[0]
+
+            # load data
+            time_tmp = time.time()
+
+            batch = self.load_to_device(batch, self.device)
+            label, inputs = get_inputs_labels(batch, self.train_strategy)
+            preds = self.model_train(inputs, self.model)
             # adapt preds to the loss calculator
             preds = self.preds_adapter.adapt(preds)
             losses = self.LossCalculator.calc_loss(preds, label, self.criterion)
@@ -101,7 +284,7 @@ class Trainer(TrainerSubject):
             for batch in dataloader_valid:
                 batch = self.load_to_device(batch, self.device)
                 label, inputs = get_inputs_labels(batch, self.train_strategy)
-                valid_preds = model_predict(inputs, self.model, self.train_strategy)
+                valid_preds = self.model_predict(inputs, self.model)
                 valid_preds = self.preds_adapter.adapt(valid_preds)
                 #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
                 losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
@@ -140,6 +323,31 @@ class Trainer(TrainerSubject):
             return [v.to(device) for v in batch]
         else:
             return batch.to(device)
+
+def model_train_register(strategy=None):
+    strategy_functions = {
+        'segment_soft_label': model_train_simple,
+        'AvgSegmentLabel_withGAN': model_train_simple,
+        'AvgSegmentLabel_withGAN2': model_train_simple,
+        'segment_soft_label_step': model_train_with_step,
+        'segment_soft_label_step_withGAN': model_train_with_step,
+        'AvgSegMutUseInLocal': model_train_avgmut_in_local,
+        'AvgSegMutAndKmerMut': model_train_with_step2,
+        'AvgSegMutAndNucSkewUseInLocal': model_train_avgmut_skew_in_local,
+        'AvgSegMutAndKmerMutUseInLocal': model_train_avgmut_kmer_in_local,
+        'AvgStepMutAndKmerMutUseInLocal': model_train_avgmut_kmer_in_local,
+        'AvgStepMutAndKmerMutCominedLoss': model_train_avgmut_kmer_in_local,
+    }
+    # backward compatible
+    if strategy is None:
+        strategy = 'segment_soft_label'
+
+    try:
+        train_function = strategy_functions[strategy]
+    except KeyError:
+        raise ValueError(f"Unsupported model train strategy: '{strategy}'")
+    return train_function
+
 
 def model_train(inputs, model, strategy=None):
     strategy_functions = {
@@ -207,8 +415,8 @@ def model_train_avgmut_kmer_in_local(batch, model):
     }
     return model(local_input, distal_x)
 
-def model_predict(batch, model, strategy=None):
-    return model_train(batch, model, strategy) 
+# def model_predict(batch, model, strategy=None):
+#     return model_train(batch, model, strategy) 
  
 def weights_init(m):
     """Initialize network layers"""
@@ -301,7 +509,7 @@ def get_inputs_labels(batch, strategy=None):
 
         if strategy == 'AvgSegMutUseInLocal':
             labels = {
-                'label': y.long().squeeze(1),
+                'label': y.long().squeeze(1) if y.dim() > 1 and y.shape[1] == 1 else y.long()
             }
             return labels, (cont_x, cat_x, distal_x, segment_mut_rate)
 
@@ -322,7 +530,7 @@ def get_inputs_labels(batch, strategy=None):
             }
         else:
             labels = {
-                'label': y.long().squeeze(1),
+                'label': y.long().squeeze(1) if y.dim() > 1 and y.shape[1] == 1 else y.long()
             }
 
         return labels, (cont_x, cat_x, distal_x, segment_mut_rate, kmer_mut_rate)

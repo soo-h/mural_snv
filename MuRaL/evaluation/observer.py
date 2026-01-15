@@ -264,14 +264,23 @@ class AdaptiveLossStrategyLossMinorStrategy(LossMinorStrategy):
     def __init__(self, printer=print):
         super().__init__()
         self.printer = printer
-        self._record_init()
+        # self._record_init()
+        self.record_init = None
 
     def reset(self):
-        self._record_init()
+        self.record_init = None
     
-    def _record_init(self):
-        for key in ['loss', 'local_loss', 'mid_loss', 'distal_loss', 'local2_loss', 'local3_loss', 'avg_mut_loss_total']:
+    def _record_init(self, loss):
+        # to-del, 2026-1-5 save it for back compatibility
+        if not isinstance(loss, dict):
+            self.keys = ['loss', 'local_loss', 'mid_loss', 'distal_loss', 'local2_loss', 'local3_loss', 'avg_mut_loss_total']
+        else:
+            self.keys = list(loss.keys())
+        # for key in ['loss', 'local_loss', 'mid_loss', 'distal_loss', 'local2_loss', 'local3_loss', 'avg_mut_loss_total']:
+        for key in self.keys:
             setattr(self, key, [])
+
+        self.record_init = True
 
         """ 
         self.loss = []
@@ -283,30 +292,36 @@ class AdaptiveLossStrategyLossMinorStrategy(LossMinorStrategy):
         """
 
     def record(self, loss):
-        for key in ['loss']:
-            getattr(self, key).append(loss[key].item())
-        for key in ['local2_loss', 'local3_loss', 'distal_loss', 'local_loss', 'mid_loss', 'avg_mut_loss_total']:
+        if self.record_init is None:
+            self._record_init(loss)
+        
+        for key in self.keys:
             if loss.get(key):
                 getattr(self, key).append(loss[key].item())
-        #self.loss.append(loss['loss'].item())
-        #self.local_loss.append(loss['local_loss'].item())
-        #self.mid_loss.append(loss['mid_loss'].item())
-        #self.distal_loss.append(loss['distal_loss'].item())
+
+        # for key in ['loss']:
+        #     getattr(self, key).append(loss[key].item())
+        # for key in ['local2_loss', 'local3_loss', 'distal_loss', 'local_loss', 'mid_loss', 'avg_mut_loss_total']:
+        #     if loss.get(key):
+        #         getattr(self, key).append(loss[key].item())
 
     def out_mean_loss(self, dataset_class, sample_number):
-        if self.local_loss:
-            self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}; Batch Var: {np.var(self.local_loss)}")
-        if self.local2_loss:
-            self.printer(f"{dataset_class} Local2 Loss: {np.sum(self.local2_loss) / sample_number}; Batch Var: {np.var(self.local2_loss)}")
-        if self.local3_loss:
-            self.printer(f"{dataset_class} Local3 Loss: {np.sum(self.local3_loss) / sample_number}; Batch Var: {np.var(self.local3_loss)}")
-        if self.mid_loss:
-            self.printer(f"{dataset_class} Mid Loss: {np.sum(self.mid_loss) / sample_number}; Batch Var: {np.var(self.mid_loss)}")
-        if self.distal_loss:
-            self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}; Batch Var: {np.var(self.distal_loss)}")
-        if self.avg_mut_loss_total:
-            self.printer(f"{dataset_class} Avg Mut Loss: {np.sum(self.avg_mut_loss_total) / sample_number}; Batch Var: {np.var(self.avg_mut_loss_total)}")
-        self.printer(f"{dataset_class} Total Loss(Mix Loss) : {np.sum(self.loss) / sample_number} ; Batch Var: {np.var(self.loss)}")
+        for key in self.keys:
+            self.printer(f"{dataset_class} {key}: {np.sum(getattr(self, key)) / sample_number}; Batch Var: {np.var(getattr(self, key))}")
+
+        # if self.local_loss:
+        #     self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}; Batch Var: {np.var(self.local_loss)}")
+        # if self.local2_loss:
+        #     self.printer(f"{dataset_class} Local2 Loss: {np.sum(self.local2_loss) / sample_number}; Batch Var: {np.var(self.local2_loss)}")
+        # if self.local3_loss:
+        #     self.printer(f"{dataset_class} Local3 Loss: {np.sum(self.local3_loss) / sample_number}; Batch Var: {np.var(self.local3_loss)}")
+        # if self.mid_loss:
+        #     self.printer(f"{dataset_class} Mid Loss: {np.sum(self.mid_loss) / sample_number}; Batch Var: {np.var(self.mid_loss)}")
+        # if self.distal_loss:
+        #     self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}; Batch Var: {np.var(self.distal_loss)}")
+        # if self.avg_mut_loss_total:
+        #     self.printer(f"{dataset_class} Avg Mut Loss: {np.sum(self.avg_mut_loss_total) / sample_number}; Batch Var: {np.var(self.avg_mut_loss_total)}")
+        # self.printer(f"{dataset_class} Total Loss(Mix Loss) : {np.sum(self.loss) / sample_number} ; Batch Var: {np.var(self.loss)}")
 
         return {'loss' : np.sum(self.loss) / sample_number}
     

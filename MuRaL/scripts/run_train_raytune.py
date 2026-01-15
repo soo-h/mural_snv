@@ -62,6 +62,8 @@ def parse_arguments(parser):
     model_args = parser.add_argument_group('Model-related arguments')
     learn_args = parser.add_argument_group('Learning-related arguments')
     raytune_args = parser.add_argument_group('RayTune-related arguments')
+    Bayes_args = parser.add_argument_group('Bayes-related arguments')
+
     optional.title = 'Other arguments' 
 
     required.add_argument('--ref_genome', type=str, metavar='FILE', default='',  
@@ -425,6 +427,19 @@ def parse_arguments(parser):
                           Rerun errored or incomplete trials. Default: False.
                           """ ).strip())
     
+    Bayes_args.add_argument('--use_bayesian', default=False, action='store_true',
+                          help=textwrap.dedent("""
+                          Use Bayesian model. Default: False.
+                          """ ).strip())
+    Bayes_args.add_argument("--bnn_config", default=None, type=str, help=textwrap.dedent("""
+                          Path to the JSON file containing Bayesian model configuration. Default: None
+                          """).strip()
+                          )
+    Bayes_args.add_argument("--kl_weight", default=1, type=float, help=textwrap.dedent("""
+                          Weight for KL divergence loss. Default: 1
+                          """).strip()
+                          )
+    
     optional.add_argument('-v', '--version', action='version',
                         version='%(prog)s {}'.format(__version__))
     
@@ -723,7 +738,6 @@ def main():
         'custom_dataloader' : args.custom_dataloader,
         'mix_loss': args.mix_loss,
         'calc_loss_strategy_name': args.calc_loss_strategy_name,
-        'step_avg_strategy': args.step_avg_strategy,
     }
         para=False
         if args.grad_accumu:
