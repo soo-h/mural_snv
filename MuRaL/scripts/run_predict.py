@@ -344,7 +344,8 @@ def main():
     preprocess_config.update(feature_config)
 
 
-    calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is not None else args.calc_loss_strategy_name
+    calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is None else args.calc_loss_strategy_name
+    print("calc_loss_strategy_name:", calc_loss_strategy_name)
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5)
     dataset_test = preprocessor_pipline.preprocess_dataset(args.test_data, args.ref_genome, use_segment_task=use_segment_task)
     segmentLoader_test = DataLoader(dataset_test, 1, shuffle=False, pin_memory=False,  collate_fn=dict_to_tuple_collate)

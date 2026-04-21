@@ -3,7 +3,7 @@ import time
 
 import torch.nn.functional as F
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2
-from MuRaL.training.train import TrainerSubject, get_inputs_labels, model_train, model_train_register
+from MuRaL.training.train import TrainerSubject, get_inputs_labels, model_train_register
 
 
 
@@ -110,7 +110,8 @@ def model_predict(batch, model, detach, strategy):
         return model.predict((cont_x, cat_x), distal_x)
     else:
         #return model.forward((cont_x, cat_x), distal_x)
-        return model_train(batch, model, strategy)
+        model_train = model_train_register(strategy)
+        return model_train(batch, model)
 
 class BayesianPredictor(TrainerSubject):
     def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False) -> None:

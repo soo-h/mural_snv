@@ -103,7 +103,7 @@ def train(config, args, checkpoint_dir=None):
 
     preprocess_config.update(feature_config)
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5, printer=print)
-    calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is not None else args.calc_loss_strategy_name
+    calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is None else args.calc_loss_strategy_name
     # (2025.12.18 to do): 根据config中是否包含sequence外的feature决定segment task是True or False
     dataset = preprocessor_pipline.preprocess_dataset(args.train_data, args.ref_genome, use_segment_task=use_segment_task)
 

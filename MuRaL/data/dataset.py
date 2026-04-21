@@ -39,7 +39,7 @@ def dict_to_tuple_collate(batch):
     result = [dict_batch[key] for key in required_keys]
     
     # 3. 可选字段
-    optional_keys = ['step_avg_mut', 'segment_avg_kmer_mut', 'nuc_skew']
+    optional_keys = ['step_avg_mut', 'segment_avg_kmer_mut', 'arg_feature', 'nuc_skew']
     for key in optional_keys:
         if key in dict_batch:
             result.append(dict_batch[key])

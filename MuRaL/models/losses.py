@@ -59,6 +59,7 @@ class LossCalcStrategyFactory:
             'AvgSegMutAndNucSkewUseInLocal' : AdaptiveLossStrategy2,
             'AvgSegMutAndKmerMutUseInLocal' : AdaptiveLossStrategy2,
             'AvgStepMutAndKmerMutUseInLocal' : AdaptiveLossStrategy2,
+            'SKA_local' : AdaptiveLossStrategy2,
 
             'AvgStepMutAndKmerMutCominedLoss': CombinedAvgMutLoss,
         }
@@ -171,6 +172,9 @@ class AdaptiveLossStrategy2():
 
         loss_distal = criterion(distal, y) if distal is not None else None
 
+        arg_feature = preds.get('arg_feature')
+        loss_arg_feature = criterion(arg_feature, y) if arg_feature is not None else None
+
         loss_dual_head = 0
         if 'local_h1' in preds:
             assert 'local_h2' in preds, "Both local_h1 and local_h2 should be present"
@@ -188,6 +192,7 @@ class AdaptiveLossStrategy2():
                 'mid_loss' : loss_mid, 
                 'distal_loss' : loss_distal, 
                 'dual_head_loss' : loss_dual_head,
+                'arg_feature_loss' : loss_arg_feature,
                 'loss' : self.total_loss} 
     
     def check_preds(self, preds):

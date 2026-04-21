@@ -2,6 +2,10 @@ import torch
 import time
 import sys
 
+from dataclasses import dataclass
+from typing import Dict, Tuple, Any, Callable
+from enum import Enum, auto
+
 import torch.nn as nn
 import torch.nn.functional as F
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, ContributionMinor, ContributionMinor2
@@ -324,6 +328,7 @@ class Trainer(TrainerSubject):
         else:
             return batch.to(device)
 
+# to-do : same as get_inputs_labels
 def model_train_register(strategy=None):
     strategy_functions = {
         'segment_soft_label': model_train_simple,
@@ -337,6 +342,7 @@ def model_train_register(strategy=None):
         'AvgSegMutAndKmerMutUseInLocal': model_train_avgmut_kmer_in_local,
         'AvgStepMutAndKmerMutUseInLocal': model_train_avgmut_kmer_in_local,
         'AvgStepMutAndKmerMutCominedLoss': model_train_avgmut_kmer_in_local,
+        'SKA_local': model_train_avgmut_kmer_arg_in_local,
     }
     # backward compatible
     if strategy is None:
@@ -347,32 +353,6 @@ def model_train_register(strategy=None):
     except KeyError:
         raise ValueError(f"Unsupported model train strategy: '{strategy}'")
     return train_function
-
-
-def model_train(inputs, model, strategy=None):
-    strategy_functions = {
-        'segment_soft_label': model_train_simple,
-        'AvgSegmentLabel_withGAN': model_train_simple,
-        'AvgSegmentLabel_withGAN2': model_train_simple,
-        'segment_soft_label_step': model_train_with_step,
-        'segment_soft_label_step_withGAN': model_train_with_step,
-        'AvgSegMutUseInLocal': model_train_avgmut_in_local,
-        'AvgSegMutAndKmerMut': model_train_with_step2,
-        'AvgSegMutAndNucSkewUseInLocal': model_train_avgmut_skew_in_local,
-        'AvgSegMutAndKmerMutUseInLocal': model_train_avgmut_kmer_in_local,
-        'AvgStepMutAndKmerMutUseInLocal': model_train_avgmut_kmer_in_local,
-        'AvgStepMutAndKmerMutCominedLoss': model_train_avgmut_kmer_in_local,
-    }
-
-    if strategy is None:
-        strategy = 'segment_soft_label'
-
-    try:
-        train_function = strategy_functions[strategy]
-    except KeyError:
-        raise ValueError(f"Unsupported model train strategy: '{strategy}'")
-
-    return train_function(inputs, model)
 
 def model_train_simple(batch, model):
     cont_x, cat_x, distal_x = batch
@@ -415,9 +395,16 @@ def model_train_avgmut_kmer_in_local(batch, model):
     }
     return model(local_input, distal_x)
 
-# def model_predict(batch, model, strategy=None):
-#     return model_train(batch, model, strategy) 
- 
+def model_train_avgmut_kmer_arg_in_local(batch, model):
+    cont_x, cat_x, distal_x, avg_mut_label, avg_kmer_mut, arg_feature = batch
+    local_input = {
+        'cont_data': cont_x,
+        'cat_data': cat_x,
+        'avg_mutations': avg_mut_label,
+        'segment_avg_kmer_mut': avg_kmer_mut,
+    }
+    return model(local_input, distal_x, arg_feature)
+
 def weights_init(m):
     """Initialize network layers"""
     classname = m.__class__.__name__
@@ -472,87 +459,6 @@ class TorchBackendManager:
         self.printer("torch._C._cuda_getDeviceCount():", torch._C._cuda_getDeviceCount())
         self.printer("torch.cuda.device_count(): ", torch.cuda.device_count())
 
-def get_inputs_labels(batch, strategy=None):
-    SegmentAvgMutStrategies = {
-        'AvgSegmentLabel_withGAN', 
-        'AvgSegmentLabel_withGAN2', 
-        'AvgSegMutUseInLocal'
-    }
-
-    SegmentAvgMutAndIDStrategies = {
-        'segment_soft_label', 
-        'segment_soft_label_step', 
-        'segment_soft_label_step_withGAN'
-    }
-
-    if strategy is None:
-        y, cont_x, cat_x, distal_x = batch
-        return y.long().squeeze(1), (cont_x, cat_x, distal_x)
-
-    elif strategy in SegmentAvgMutAndIDStrategies:
-        y, cat_x, distal_x, segment_id, segment_mut_rate = batch
-        cont_x = 0
-        labels = {
-            'label': y.long().squeeze(1),
-            'segment_id': segment_id,
-            'avg_mut': segment_mut_rate
-            }
-        if strategy == 'segment_soft_label':
-            # no bw used--- specify cont_x = 0
-
-            return labels, (cont_x, cat_x, distal_x)
-        return labels, (cont_x, cat_x, distal_x, segment_mut_rate, segment_id)
-
-    elif strategy in SegmentAvgMutStrategies:
-        y, cat_x, distal_x, segment_mut_rate = batch
-        cont_x = 0
-
-        if strategy == 'AvgSegMutUseInLocal':
-            labels = {
-                'label': y.long().squeeze(1) if y.dim() > 1 and y.shape[1] == 1 else y.long()
-            }
-            return labels, (cont_x, cat_x, distal_x, segment_mut_rate)
-
-        labels = {
-            'label': y.long().squeeze(1),
-            'avg_mut': segment_mut_rate
-        }
-        return labels, (cont_x, cat_x, distal_x)
-    elif strategy == 'AvgSegMutAndKmerMut' or strategy == 'AvgSegMutAndKmerMutUseInLocal' or strategy == 'AvgStepMutAndKmerMutUseInLocal':
-        y, cat_x, distal_x, segment_mut_rate, kmer_mut_rate = batch
-        cont_x = 0
-
-        if strategy == 'AvgSegMutAndKmerMut':
-            labels = {
-                'label': y.long().squeeze(1),
-                'avg_mut': segment_mut_rate,
-                'avg_kmer_mut': kmer_mut_rate
-            }
-        else:
-            labels = {
-                'label': y.long().squeeze(1) if y.dim() > 1 and y.shape[1] == 1 else y.long()
-            }
-
-        return labels, (cont_x, cat_x, distal_x, segment_mut_rate, kmer_mut_rate)
-    
-    elif strategy == 'AvgStepMutAndKmerMutCominedLoss':
-        y, cat_x, distal_x, segment_mut_rate, kmer_mut_rate = batch
-        cont_x = 0
-        labels = {
-            'label': y.long().squeeze(1),
-            'avg_mut': segment_mut_rate,
-        }
-        return labels, (cont_x, cat_x, distal_x, segment_mut_rate, kmer_mut_rate)
-    
-    elif strategy == 'AvgSegMutAndNucSkewUseInLocal':
-        y, cat_x, distal_x, segment_mut_rate, nuc_skew = batch
-        cont_x = 0
-        labels = {
-            'label': y.long().squeeze(1),
-        }
-        return labels, (cont_x, cat_x, distal_x, segment_mut_rate, nuc_skew)
-
-
 class AdaptPreds:
     def __init__(self, model_no, strategy):
         self.strategy = strategy
@@ -582,3 +488,94 @@ class AdaptPreds:
                 'out' : out
             }
 
+@dataclass
+class BatchConfig:
+    has_avg_mut: bool = False
+    has_kmer_mut: bool = False
+    has_arg_feature: bool = False
+
+    include_avg_mut_in_inputs: bool = False
+    include_kmer_mut_in_inputs: bool = False
+    inclued_arg_feature_in_inputs: bool = False
+
+    include_avg_mut_in_labels: bool = False
+    include_kmer_mut_in_labels: bool = False
+    include_arg_feature_in_labels: bool = False
+
+# 策略注册表
+# 策略命名规范：
+# [特征]_[标签类型]_[输入模式]
+# 
+# 特征代号:
+#   S = Segment mutation rate
+#   K = Kmer mutation rate  
+#   A = ARG features
+#   N = Nucleotide skew
+#
+# 标签类型:
+#   hard = 硬标签
+#   soft = 软标签 (segment level)
+#   step = 软标签 (step level)
+#
+# 输入模式:
+#   loss = 仅用于loss计算
+#   local = 作为local模型输入
+#   gan = 使用GAN
+STRATEGY_CONFIGS: Dict[str, BatchConfig] = {
+    'AvgStepMutAndKmerMutUseInLocal': BatchConfig(
+        has_avg_mut=True, has_kmer_mut=True,
+        include_avg_mut_in_inputs=True, include_kmer_mut_in_inputs=True
+    ),
+
+    'SKA_local': BatchConfig(
+        has_avg_mut=True, has_kmer_mut=True, has_arg_feature=True,
+        include_avg_mut_in_inputs=True, include_kmer_mut_in_inputs=True, inclued_arg_feature_in_inputs=True
+    ),
+
+}
+
+def get_inputs_labels(batch, strategy=None):
+    """统一的batch处理函数"""
+    
+    # 默认策略：原始4元素batch
+    if strategy is None:
+        y, cont_x, cat_x, distal_x = batch
+        return y.long().squeeze(1), (cont_x, cat_x, distal_x)
+    
+    config = STRATEGY_CONFIGS.get(strategy)
+    if config is None:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    
+    # 解包batch（根据配置）
+    batch_iter = iter(batch)
+    y = next(batch_iter)
+    cat_x = next(batch_iter)
+    distal_x = next(batch_iter)
+    
+    segment_avg_mut = next(batch_iter) if config.has_avg_mut else None
+    kmer_mut = next(batch_iter) if config.has_kmer_mut else None
+    arg_feature = next(batch_iter) if config.has_arg_feature else None
+    
+    # 构建labels
+    labels = {'label': _process_label(y)}
+    if config.include_avg_mut_in_labels and segment_avg_mut is not None:
+        labels['avg_mut'] = segment_avg_mut
+    if config.include_kmer_mut_in_labels and kmer_mut is not None:
+        labels['avg_kmer_mut'] = kmer_mut
+    
+    # 构建inputs
+    inputs = [0, cat_x, distal_x]  # cont_x = 0
+    if config.include_avg_mut_in_inputs:
+        inputs.append(segment_avg_mut)
+    if config.include_kmer_mut_in_inputs:
+        inputs.append(kmer_mut)
+    if config.inclued_arg_feature_in_inputs:
+        inputs.append(arg_feature)
+    
+    return labels, tuple(inputs)
+
+def _process_label(y):
+    """统一的label处理"""
+    if y.dim() > 1 and y.shape[1] == 1:
+        return y.long().squeeze(1)
+    return y.long()

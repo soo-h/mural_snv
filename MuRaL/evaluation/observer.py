@@ -467,6 +467,7 @@ class LossMinor(Observer):
         'AvgSegMutAndKmerMutUseInLocal': AdaptiveLossStrategyLossMinorStrategy,
         'AvgStepMutAndKmerMutUseInLocal': AdaptiveLossStrategyLossMinorStrategy,
         'AvgStepMutAndKmerMutCominedLoss': AdaptiveLossStrategyLossMinorStrategy,
+        'SKA_local' : AdaptiveLossStrategyLossMinorStrategy,
     }
 
     def __init__(self, calc_loss_strategy_name=None, printer=print):
