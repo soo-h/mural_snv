@@ -44,7 +44,7 @@ class Predictor(TrainerSubject):
         with torch.no_grad():
             for batch in dataloader_test:
                 batch = self.load_to_device(batch, self.device)
-                label, inputs = get_inputs_labels(batch, self.train_strategy)
+                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
                 valid_preds = model_predict(inputs, self.model, self.detach, self.train_strategy)
                 #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
                 losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
@@ -73,7 +73,7 @@ class Predictor(TrainerSubject):
         with torch.no_grad():
             for batch in dataloader_test:
                 batch = self.load_to_device(batch, self.device)
-                label, inputs = get_inputs_labels(batch, self.train_strategy)
+                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
                 valid_preds = model_predict(inputs, self.model, self.detach, self.train_strategy)
                 #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
                 losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
@@ -155,7 +155,7 @@ class BayesianPredictor(TrainerSubject):
         with torch.no_grad():
             for batch in dataloader_test:
                 batch = self.load_to_device(batch, self.device)
-                label, inputs = get_inputs_labels(batch, self.train_strategy)
+                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
                 pred_results = []
                 output_mc = []
                 for mc_run in range(int(self.num_monte_carlo)):

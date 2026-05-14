@@ -138,11 +138,14 @@ def parse_arguments(parser):
                           --n_h5_files files can reduce the time for generating HDF5 files.
                           Default: 1.                          """ ).strip())
     
-    data_args.add_argument('--save_valid_preds', default=False, action='store_true', 
+    data_args.add_argument('--save_valid_preds', default=False, action='store_true',
                           help=textwrap.dedent("""
                           Save prediction results for validation data in the checkpoint
                           folders. Default: False.
                           """ ).strip())
+
+    data_args.add_argument('--recurrent', default=False, action='store_true',
+                        help='Use per-site sample weights from BED name field for loss weighting. Default: False.')
 
     data_args.add_argument('--feature_config', default=None, type=str, help=textwrap.dedent("""
                           Path to the JSON file containing feature configuration.

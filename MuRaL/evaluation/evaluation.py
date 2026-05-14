@@ -22,6 +22,7 @@ from dirichletcal.calib.vectorscaling import VectorScaling
 from dirichletcal.calib.tempscaling import TemperatureScaling
 from dirichletcal.calib.fulldirichlet import FullDirichletCalibrator
 from sklearn.multiclass import OneVsRestClassifier
+from MuRaL.utils.info_utils import parse_info
 
 def count_parameters(model):
     """Count parameters in a network model"""
@@ -88,25 +89,37 @@ def f3mer_comp(data_and_prob):
     
     return obs_pred_freq['mut_type'].corr(obs_pred_freq['prob'])
 
-def freq_kmer_comp_multi(data_and_prob, k, n_class):
+def freq_kmer_comp_multi(data_and_prob, k, n_class, use_obs_count=False):
     """Compare the observed and predicted frequencies of mutations in 3-mers"""
-    
+
     # Generate the column names
     d = k//2
     mer_list = ['us'+str(i) for i in list(range(1, d+1))[::-1]] + ['ds'+str(i) for i in list(range(1, d+1))]
-    
+
     prob_list = ['prob'+str(i) for i in range(n_class)]
-    
+
     corr_list = []
     for i in range(0, n_class):
-        obs_pred_freq = pd.concat([data_and_prob[ mer_list + [prob_list[i]]], data_and_prob['mut_type']==i ], axis=1)
-        
+        if use_obs_count:
+            obs_col = data_and_prob['sample_weight'].where(
+                data_and_prob['mut_type'] == i, 0.0
+                ).rename('obs')
+        else:
+            obs_col = (data_and_prob['mut_type'] == i).astype(float).rename('obs')
+        obs_pred_freq = pd.concat(
+            [data_and_prob[ mer_list + [prob_list[i]]], obs_col], axis=1
+            )
+
         # Get average rates for each k-mer
         obs_pred_freq = obs_pred_freq.groupby(mer_list).mean()
-        
-        # Calcuate correlations 
-        corr_list.append(obs_pred_freq['mut_type'].astype(float).corr(obs_pred_freq[prob_list[i]].astype(float)))
-        
+
+        # Calcuate correlations
+        corr_list.append(
+            obs_pred_freq['obs'].astype(float).corr(
+                obs_pred_freq[prob_list[i]].astype(float)
+                )
+                )
+
     return corr_list
 
 def f3mer_comp_rand(df, n_rows):
@@ -164,30 +177,30 @@ def f7mer_comp_rand(df, n_rows):
     
     print('mean corr:', mean_corr/sampling_times)
 
-def corr_calc_sub(data, window, prob_names):
+def corr_calc_sub(data, window, prob_names, use_obs_count=False):
     """Calculate regional correlations"""
     n_class = len(prob_names)
     obs = [0]*n_class
     pred = [0]*n_class
-    
+
     count = 0
-    n_sites = len(data) 
-    
+    n_sites = len(data)
+
     avg_names = []
     for i in range(n_class):
         avg_names = avg_names +['avg_obs'+str(i), 'avg_pred'+str(i)]
-    
+
     last_chrom = data.loc[0, 'chrom']
     last_start = data.loc[0, 'start']//window * window # Find the window start
-    
+
     result = pd.DataFrame(columns=avg_names)
     for i in range(n_sites):
         # First, find the corresponding window
         start = data.loc[i, 'start']//window * window
         chrom = data.loc[i, 'chrom']
-        
+
         if chrom != last_chrom or start != last_start:
-            # Calculate avg of the last region  
+            # Calculate avg of the last region
             avg_list = []
             for j in range(n_class):
                 avg_list += [obs[j]/count, pred[j]/count]
@@ -199,10 +212,14 @@ def corr_calc_sub(data, window, prob_names):
             count = 0
             last_chrom = chrom
             last_start = start
-            
+
         # Count for observed type +1
-        obs[int(data.loc[i, 'mut_type'])] += 1              
-        
+        if not use_obs_count:
+            obs_count = 1
+        else:
+            obs_count = parse_info(data.loc[i, 'info'])
+        obs[int(data.loc[i, 'mut_type'])] += obs_count
+
         # Add to the cumulative mutation probs
         for j in range(n_class):
             pred[j] += data.loc[i, prob_names[j]]
@@ -235,15 +252,22 @@ def corr_calc_sub(data, window, prob_names):
     
     return corr_list
 
-def calc_avg_prob(df, n_class):
-    
+def calc_avg_prob(df, n_class, use_obs_count=False):
+
     avg_list = []
-    for i in range(n_class):
-        avg_list.append(sum(list(df['mut_type'] == i)) / df.shape[0])
+    if use_obs_count:
+        total_count = df['sample_weight'].sum()
+        for i in range(n_class):
+            avg_list.append(
+                df['sample_weight'].where(df['mut_type'] == i, 0.0).sum() / total_count
+                )
+    else:
+        for i in range(n_class):
+            avg_list.append(sum(list(df['mut_type'] == i)) / df.shape[0])
 
     for i in range(n_class):
         avg_list.append(df['prob'+str(i)].mean())
-        
+
     return avg_list
         
                         

@@ -187,6 +187,9 @@ def parse_arguments(parser):
                           """).strip()
                           )
 
+    optional.add_argument('--recurrent', default=False, action='store_true',
+                        help='Use per-site sample weights from BED name field for evaluation. Default: False.')
+
     Bayes_args.add_argument('--use_bayesian', default=False, action='store_true',
                           help=textwrap.dedent("""
                           Use Bayesian model. Default: False.
@@ -465,29 +468,33 @@ def main():
             prob_cal = calibr.predict_proba(y_prob.to_numpy())  
             y_prob = pd.DataFrame(data=np.copy(prob_cal), columns=prob_names)
 
-    # Combine data 
-    cols = ['mut_type'] + all_prob_names
+    # Combine data
+    use_obs_count = args.recurrent
 
     data_and_prob = pd.concat(dfs, axis=1)
-    test_pred_df = data_and_prob[cols]
 
     # Write the prediction
     chr_pos = get_position_info(BedTool(args.test_data), segment_center)
-    pred_df = pd.concat((chr_pos, test_pred_df), axis=1)
-    pred_df.columns = ['chrom', 'start', 'end', 'strand'] +  cols
+    # 验证mut_type一致性
+    assert (chr_pos['mut_type'].astype(int).values ==
+        data_and_prob['mut_type'].astype(int).values).all(), \
+            'ERROR: mut_type mismatch between position info and prediction data. ' \
+                'BED file or data pipeline may have inconsistent ordering.'
+    pred_df = pd.concat((chr_pos, y_prob), axis=1)
     pred_df.sort_values(['chrom', 'start'], inplace=True)
     pred_df.reset_index(drop=True, inplace=True)
+    # 输出文件包含info列
     pred_df.to_csv(pred_file, sep='\t', float_format='%.4g', index=False)
     
     #do k-mer evaluation
     if len(kmer_corr) > 0:
         modes = [i%2 for i in kmer_corr]
-        
+
         if sum(modes) != len(kmer_corr) or min(kmer_corr) < 0:
             print('Warning: please provide odd positive mumbers for k-mer lengths', kmer_corr, '. No k-mer correlation was calculated.')
         else:
             for kmer in kmer_corr:
-                print(str(kmer)+'mer correlation: ', freq_kmer_comp_multi(data_and_prob, kmer, n_class))
+                print(str(kmer)+'mer correlation: ', freq_kmer_comp_multi(data_and_prob, kmer, n_class, use_obs_count))
    
     # Calculate regional correlations for a few window sizes
     #for win_size in [10000, 50000, 200000]:
@@ -498,7 +505,7 @@ def main():
             pred_df.sort_values(['chrom', 'start'], inplace=True)
             
             for win_size in region_corr:
-                corr = corr_calc_sub(pred_df, win_size, prob_names)
+                corr = corr_calc_sub(pred_df, win_size, prob_names, use_obs_count)
                 print('regional corr:', str(win_size)+'bp', corr)
 
     print('Total time used: %s seconds' % (time.time() - start_time))

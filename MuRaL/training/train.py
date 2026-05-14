@@ -76,7 +76,7 @@ class BayesianTrainer(TrainerSubject):
             time_tmp = time.time()
 
             batch = self.load_to_device(batch, self.device)
-            label, inputs = get_inputs_labels(batch, self.train_strategy)
+            label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
 
             # bayesian monte carlo
             output_ = []
@@ -92,7 +92,7 @@ class BayesianTrainer(TrainerSubject):
             output = self._merge_mc_outputs(output_, mode="mean")
             kl = torch.mean(torch.stack(kl_), dim=0) / self.config['batch_size']
 
-            losses = self.LossCalculator.calc_loss(output, label, self.criterion)
+            losses = self.LossCalculator.calc_loss(output, label, self.criterion, sample_weight)
             loss = self.LossCalculator.extract_total_loss()
             loss += kl  * self.config['kl_weight']
             self.optimizer.zero_grad()
@@ -129,7 +129,7 @@ class BayesianTrainer(TrainerSubject):
         with torch.no_grad():
             for batch in dataloader_valid:
                 batch = self.load_to_device(batch, self.device)
-                label, inputs = get_inputs_labels(batch, self.train_strategy)
+                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
 
                 pred_results = [] # used loss calc
                 output_mc = [] # used ensemble predict(mean) and uncertainty(std)
@@ -138,7 +138,7 @@ class BayesianTrainer(TrainerSubject):
                     valid_preds = self.preds_adapter.adapt(valid_preds)
                     pred_results.append(valid_preds)
                     final_pred = self._extract_final_pred(valid_preds)
-                    # ensemble, softmax first 
+                    # ensemble, softmax first
                     output_mc.append(F.softmax(final_pred, dim=1))
                 pred_results = self._merge_mc_outputs(pred_results, mode="mean")
                 output_mc = torch.stack(output_mc)
@@ -148,7 +148,7 @@ class BayesianTrainer(TrainerSubject):
                 pred_y_uncertain = torch.cat((pred_y_uncertain, stds), dim=0)
 
 
-                losses = self.LossCalculator.calc_loss(pred_results, label, self.criterion)
+                losses = self.LossCalculator.calc_loss(pred_results, label, self.criterion, sample_weight)
                 #valid_pred = self.LossCalculator.extract_pred(valid_preds)
                 sample_number = batch[0].shape[0]
 
@@ -251,11 +251,11 @@ class Trainer(TrainerSubject):
             time_tmp = time.time()
 
             batch = self.load_to_device(batch, self.device)
-            label, inputs = get_inputs_labels(batch, self.train_strategy)
+            label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
             preds = self.model_train(inputs, self.model)
             # adapt preds to the loss calculator
             preds = self.preds_adapter.adapt(preds)
-            losses = self.LossCalculator.calc_loss(preds, label, self.criterion)
+            losses = self.LossCalculator.calc_loss(preds, label, self.criterion, sample_weight)
             loss = self.LossCalculator.extract_total_loss()
             self.optimizer.zero_grad()
             loss.backward()
@@ -287,11 +287,11 @@ class Trainer(TrainerSubject):
         with torch.no_grad():
             for batch in dataloader_valid:
                 batch = self.load_to_device(batch, self.device)
-                label, inputs = get_inputs_labels(batch, self.train_strategy)
+                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
                 valid_preds = self.model_predict(inputs, self.model)
                 valid_preds = self.preds_adapter.adapt(valid_preds)
                 #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
-                losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
+                losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion, sample_weight)
                 #valid_pred = self.LossCalculator.extract_pred(valid_preds)
                 sample_number = batch[0].shape[0]
 
@@ -536,33 +536,45 @@ STRATEGY_CONFIGS: Dict[str, BatchConfig] = {
 
 def get_inputs_labels(batch, strategy=None):
     """统一的batch处理函数"""
-    
+
     # 默认策略：原始4元素batch
     if strategy is None:
-        y, cont_x, cat_x, distal_x = batch
-        return y.long().squeeze(1), (cont_x, cat_x, distal_x)
-    
+        # 检查是否有 sample_weight
+        if len(batch) == 5:
+            y, cont_x, cat_x, distal_x, sample_weight = batch
+            return y.long().squeeze(1), (cont_x, cat_x, distal_x), sample_weight
+        else:
+            y, cont_x, cat_x, distal_x = batch
+            return y.long().squeeze(1), (cont_x, cat_x, distal_x), None
+
     config = STRATEGY_CONFIGS.get(strategy)
     if config is None:
         raise ValueError(f"Unknown strategy: {strategy}")
-    
+
     # 解包batch（根据配置）
     batch_iter = iter(batch)
     y = next(batch_iter)
     cat_x = next(batch_iter)
     distal_x = next(batch_iter)
-    
+
     segment_avg_mut = next(batch_iter) if config.has_avg_mut else None
     kmer_mut = next(batch_iter) if config.has_kmer_mut else None
     arg_feature = next(batch_iter) if config.has_arg_feature else None
-    
+
+    # 尝试获取 sample_weight
+    sample_weight = None
+    try:
+        sample_weight = next(batch_iter)
+    except StopIteration:
+        pass
+
     # 构建labels
     labels = {'label': _process_label(y)}
     if config.include_avg_mut_in_labels and segment_avg_mut is not None:
         labels['avg_mut'] = segment_avg_mut
     if config.include_kmer_mut_in_labels and kmer_mut is not None:
         labels['avg_kmer_mut'] = kmer_mut
-    
+
     # 构建inputs
     inputs = [0, cat_x, distal_x]  # cont_x = 0
     if config.include_avg_mut_in_inputs:
@@ -571,8 +583,8 @@ def get_inputs_labels(batch, strategy=None):
         inputs.append(kmer_mut)
     if config.inclued_arg_feature_in_inputs:
         inputs.append(arg_feature)
-    
-    return labels, tuple(inputs)
+
+    return labels, tuple(inputs), sample_weight
 
 def _process_label(y):
     """统一的label处理"""

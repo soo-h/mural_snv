@@ -174,7 +174,7 @@ def train(config, args, checkpoint_dir=None):
 
     # loss and optimizer
     loss_factory = LossFactory()
-    criterion = loss_factory.create_loss()
+    criterion = loss_factory.create_loss(use_sample_weight=args.recurrent)
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=args.mix_loss)
 
     config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto, config['weight_decay']) 
@@ -227,7 +227,15 @@ def train(config, args, checkpoint_dir=None):
         valid_y = data_local_valid['mut_type'].to_numpy().squeeze()
 
         # calibrate
-        calibrator, fdiri_nll = calibrate_prob(valid_y_prob, valid_y, device, calibr_name='FullDiri')
+        if args.recurrent:
+            weights = data_local_valid['sample_weight'].values.astype(int)
+            # 按count展开验证集
+            indices = np.repeat(np.arange(len(weights)), np.maximum(weights, 1).astype(int))
+            valid_y_prob_expanded = valid_y_prob[indices]
+            valid_y_expanded = valid_y[indices]
+            calibrator, fdiri_nll = calibrate_prob(valid_y_prob_expanded, valid_y_expanded, device, calibr_name='FullDiri')
+        else:
+            calibrator, fdiri_nll = calibrate_prob(valid_y_prob, valid_y, device, calibr_name='FullDiri')
         prob_cal = calibrator.predict_proba(valid_y_prob)
 
         if n_class == 7:
@@ -235,8 +243,8 @@ def train(config, args, checkpoint_dir=None):
             report_ac_prob_correlation(valid_y_prob, n_class=n_class, n_sub=n_sub)
 
         # Evaluation- Kmer
-        evaluator_before_calibra = Evaluator(data_local_valid, valid_y_prob, n_class, printer=print)
-        evaluator_after_calibra = Evaluator(data_local_valid, prob_cal, n_class, calibra="FullDiri", printer=print)
+        evaluator_before_calibra = Evaluator(data_local_valid, valid_y_prob, n_class, use_obs_count=args.recurrent, printer=print)
+        evaluator_after_calibra = Evaluator(data_local_valid, prob_cal, n_class, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
 
         evaluator_before_calibra.evaluate_kmer()
         evaluator_after_calibra.evaluate_kmer()
@@ -342,13 +350,14 @@ def get_save_path(use_ray, trial_dir, epoch):
     return path
 
 class Evaluator:
-    def __init__(self, data_local, y_prob, n_class, calibra=None, printer=print):
+    def __init__(self, data_local, y_prob, n_class, calibra=None, use_obs_count=False, printer=print):
         self.n_class = n_class
         self.prob_names = ['prob'+str(i) for i in range(n_class)]
         self.data_local = data_local
         self.y_prob = y_prob
         self.printer = printer
         self.calibra = calibra
+        self.use_obs_count = use_obs_count
         self.data_and_prob = self.preprocess()
         self.kmer_out_identify, self.regional_out_identify = self.set_output_identifiers()
         self.metrics = {}
@@ -378,12 +387,20 @@ class Evaluator:
         if self.calibra is None:
             self.printer("valid_data_and_prob.iloc[0:10]", self.data_and_prob.iloc[0:10])
         for k in kmer_list:
-            kmer_corr = freq_kmer_comp_multi(self.data_and_prob, k, self.n_class)
+            kmer_corr = freq_kmer_comp_multi(self.data_and_prob, k, self.n_class, self.use_obs_count)
             self.printer(f"{k}{self.kmer_out_identify}", kmer_corr)
     
     def evaluate_regional_corr(self, chr_pos, win_size_list=[100000, 500000], save_valid_preds=False, save_path=None):
-        valid_pred_df = pd.concat((chr_pos, self.data_and_prob[['mut_type'] + self.prob_names]), axis=1)
-        valid_pred_df.columns = ['chrom', 'start', 'end', 'strand', 'mut_type'] + self.prob_names
+        cols = self.prob_names + (['sample_weight'] if self.use_obs_count else [])
+
+        assert (chr_pos['mut_type'].astype(int).values == self.data_and_prob['mut_type'].astype(int).values).all(), \
+            'ERROR: mut_type mismatch between position info and prediction data. ' \
+                'BED file or data pipeline may have inconsistent ordering.'
+        # if 'mut_type' not in cols:
+            # cols = ['mut_type'] + cols
+
+        valid_pred_df = pd.concat((chr_pos, self.data_and_prob[cols]), axis=1)
+        # valid_pred_df.columns = ['chrom', 'start', 'end', 'strand'] + cols
         valid_pred_df.sort_values(['chrom', 'start'], inplace=True)
         valid_pred_df.reset_index(drop=True, inplace=True)
 
@@ -391,11 +408,12 @@ class Evaluator:
             self.printer('valid_pred_df: ', valid_pred_df.head())
 
         for win_size in win_size_list:
-            corr_win = corr_calc_sub(valid_pred_df, win_size, self.prob_names)
+            corr_win = corr_calc_sub(valid_pred_df, win_size, self.prob_names, self.use_obs_count)
             self.printer(self.regional_out_identify, str(win_size)+'bp', corr_win)
-        
+
         if save_valid_preds:
-            valid_pred_df.to_csv(save_path + '.valid_preds.tsv.gz', sep='\t', float_format='%.4g', index=False)
+            save_cols = ['chrom', 'start', 'end', 'strand', 'mut_type'] + self.prob_names
+            valid_pred_df[save_cols].to_csv(save_path + '.valid_preds.tsv.gz', sep='\t', float_format='%.4g', index=False)
 
     def evaluate_regional_score(self, valid_size):
         if valid_size > 10000 * 10:
@@ -408,15 +426,15 @@ class Evaluator:
         score = 0
         corr_3mer = []
         corr_5mer = []
-            
+
         region_avg = []
         for i in range(n_regions):
-            corr_3mer = freq_kmer_comp_multi(self.data_and_prob.iloc[region_size*i: region_size*(i+1), ], 3, self.n_class)    
-            corr_5mer = freq_kmer_comp_multi(self.data_and_prob.iloc[region_size*i: region_size*(i+1), ], 5, self.n_class)
-                
+            corr_3mer = freq_kmer_comp_multi(self.data_and_prob.iloc[region_size*i: region_size*(i+1), ], 3, self.n_class, self.use_obs_count)
+            corr_5mer = freq_kmer_comp_multi(self.data_and_prob.iloc[region_size*i: region_size*(i+1), ], 5, self.n_class, self.use_obs_count)
+
             score += np.sum([(1-corr)**2 for corr in corr_3mer]) + np.sum([(1-corr)**2 for corr in corr_5mer])
-                
-            avg_prob = calc_avg_prob(self.data_and_prob.iloc[region_size*i: region_size*(i+1), ], self.n_class)
+
+            avg_prob = calc_avg_prob(self.data_and_prob.iloc[region_size*i: region_size*(i+1), ], self.n_class, self.use_obs_count)
             region_avg.append(avg_prob)
             #print("avg_prob:", avg_prob, i)
             

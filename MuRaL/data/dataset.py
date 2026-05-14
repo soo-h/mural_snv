@@ -18,7 +18,7 @@ from torch.utils.data.dataloader import default_collate
 def dict_to_tuple_collate(batch):
     """
     将 dict batch 转换为旧 Model 期望的 tuple 格式
-    
+
     Args:
         batch: List[dict], where dict = {
             'y': tensor,
@@ -27,23 +27,23 @@ def dict_to_tuple_collate(batch):
             'segment_features': tensor,  # optional
             ...
         }
-    
+
     Returns:
         根据 batch 的键动态组装 tuple
     """
     # 1. 标准的 dict batch 化
     dict_batch = default_collate(batch)
-    
+
     # 2. 按固定顺序转为 tuple（兼容旧 Model）
     required_keys = ['mut_type', 'cat_x', 'distal_x']
     result = [dict_batch[key] for key in required_keys]
-    
+
     # 3. 可选字段
-    optional_keys = ['step_avg_mut', 'segment_avg_kmer_mut', 'arg_feature', 'nuc_skew']
+    optional_keys = ['step_avg_mut', 'segment_avg_kmer_mut', 'arg_feature', 'nuc_skew', 'sample_weight']
     for key in optional_keys:
         if key in dict_batch:
             result.append(dict_batch[key])
-    
+
     return tuple(result)
 
 ###############################
@@ -77,9 +77,21 @@ class CombinedDatasetNPv2(Dataset):
         assert 'mut_type' in features, "Error: mut_type must be in features"
         data = np.concatenate(features['local_seq'].values(), axis=0) # (segment, sample, local_seq_len) --> (sample_total, local_seq_len)
         label = np.concatenate(features['mut_type'].values(), axis=0).reshape(-1, 1).astype(int) # (segment, sample) --> (sample_total, 1)
-        data_local = np.concatenate([data, label], axis=1)
-        local_radius = (data.shape[1] - 1) // 2
-        col_names = ['us'+str(local_radius - i) for i in range(local_radius)] + ['mid'] + ['ds'+str(i+1) for i in range(local_radius)] + ['mut_type']
+
+        if 'sample_weight' in features:
+            weight = np.concatenate(features['sample_weight'].values(), axis=0).reshape(-1, 1).astype(np.float32)
+            data_local = np.concatenate([data, label, weight], axis=1)
+            local_radius = (data.shape[1] - 1) // 2
+            col_names = (['us'+str(local_radius - i) for i in range(local_radius)] +
+                        ['mid'] + ['ds'+str(i+1) for i in range(local_radius)] +
+                        ['mut_type', 'sample_weight'])
+        else:
+            data_local = np.concatenate([data, label], axis=1)
+            local_radius = (data.shape[1] - 1) // 2
+            col_names = (['us'+str(local_radius - i) for i in range(local_radius)] +
+                        ['mid'] + ['ds'+str(i+1) for i in range(local_radius)] +
+                        ['mut_type'])
+
         return pd.DataFrame(data_local, columns=col_names)
         
     def _calculate_cat_dims(self, features):

@@ -8,9 +8,12 @@ class LossFactory():
     def __init__(self) -> None:
         pass
 
-    def create_loss(self, loss_name=None):
+    def create_loss(self, loss_name=None, use_sample_weight=False):
         if loss_name is None:
-            return torch.nn.CrossEntropyLoss(reduction='sum')
+            if use_sample_weight:
+                return torch.nn.CrossEntropyLoss(reduction='none')
+            else:
+                return torch.nn.CrossEntropyLoss(reduction='sum')
 
 def compute_local_distal_loss(preds, y, criterion):
     preds_local, preds_distal, preds = preds
@@ -147,7 +150,7 @@ class AdaptiveLossStrategy2():
     def __init__(self) -> None:
         self.total_loss = None
 
-    def calc_loss(self, preds, labels, criterion):
+    def calc_loss(self, preds, labels, criterion, sample_weight=None):
 
         preds, segment_preds = preds
         self.check_preds(preds)
@@ -155,42 +158,52 @@ class AdaptiveLossStrategy2():
 
         y = labels.get('label')
 
+        # 辅助函数：计算加权或普通损失
+        def _calc_loss(pred, target):
+            if pred is None:
+                return None
+            loss = criterion(pred, target)
+            if sample_weight is not None and loss.dim() > 0:
+                # 如果 criterion 返回的是逐样本损失（reduction='none'）
+                return (loss * sample_weight.squeeze()).sum()
+            return loss
+
         mid = preds.get('mid')
         distal = preds.get('distal')
         out = preds.get('out')
 
         local1 = preds.get('local')
-        loss_local1 = criterion(local1, y) if local1 is not None else None
+        loss_local1 = _calc_loss(local1, y)
 
         local2 = preds.get('local2')
-        loss_local2 = criterion(local2, y) if local2 is not None else None
+        loss_local2 = _calc_loss(local2, y)
 
         local3 = preds.get('local3')
-        loss_local3 = criterion(local3, y) if local3 is not None else None
+        loss_local3 = _calc_loss(local3, y)
 
-        loss_mid = criterion(mid, y) if mid is not None else None
+        loss_mid = _calc_loss(mid, y)
 
-        loss_distal = criterion(distal, y) if distal is not None else None
+        loss_distal = _calc_loss(distal, y)
 
         arg_feature = preds.get('arg_feature')
-        loss_arg_feature = criterion(arg_feature, y) if arg_feature is not None else None
+        loss_arg_feature = _calc_loss(arg_feature, y)
 
         loss_dual_head = 0
         if 'local_h1' in preds:
             assert 'local_h2' in preds, "Both local_h1 and local_h2 should be present"
-            loss_local_h1 = criterion(preds['local_h1'], self._to_h1_label(y))
-            loss_local_h2 = criterion(preds['local_h2'], self._to_h2_label(y))
+            loss_local_h1 = _calc_loss(preds['local_h1'], self._to_h1_label(y))
+            loss_local_h2 = _calc_loss(preds['local_h2'], self._to_h2_label(y))
             loss_dual_head = loss_local_h1 + loss_local_h2
 
-        loss = criterion(out, y)
+        loss = _calc_loss(out, y)
 
         self.total_loss = loss + 0.25 * loss_dual_head
 
-        return {'local_loss': loss_local1, 
-                'local2_loss' : loss_local2, 
-                'local3_loss' : loss_local3, 
-                'mid_loss' : loss_mid, 
-                'distal_loss' : loss_distal, 
+        return {'local_loss': loss_local1,
+                'local2_loss' : loss_local2,
+                'local3_loss' : loss_local3,
+                'mid_loss' : loss_mid,
+                'distal_loss' : loss_distal,
                 'dual_head_loss' : loss_dual_head,
                 'arg_feature_loss' : loss_arg_feature,
                 'loss' : self.total_loss} 

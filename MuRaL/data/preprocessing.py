@@ -175,14 +175,14 @@ def get_position_info(test_bed, central_radius):
     Get validation position information
 
     Returns:
-    pd.DataFrame: A DataFrame containing the chromosome, start, end, and strand 
+    pd.DataFrame: A DataFrame containing the chromosome, start, end, and strand
                   information with columns ['chrom', 'start', 'end', 'strand'].
     """
     bed_generator = bed_reader(test_bed, central_radius)
     info = []
-    for batch, stand in bed_generator:
-        info.extend([[nucleo.chrom, nucleo.start, nucleo.end, stand] for nucleo in batch])
-    info = pd.DataFrame(info, columns=['chrom', 'start', 'end', 'stand'])
+    for batch, strand in bed_generator:
+        info.extend([[nucleo.chrom, nucleo.start, nucleo.end, nucleo.name, strand, nucleo.score] for nucleo in batch])
+    info = pd.DataFrame(info, columns=['chrom', 'start', 'end', 'info', 'strand', 'mut_type'])
     return info
 
 def get_position_info_by_trainset(test_bed, central_radius):
@@ -593,17 +593,18 @@ def prepare_local_feature(segments, ref_genome, local_radius, local_order, names
     # bed_generator = bed_reader(bed_regions, central_segment)
     seqs_information_generator = seq_generator(segments, ref_records=ref_genome, local_radius=local_radius)
     y = []
+    w = []
     local_seq = []
     local_seq_encode = []
 
     # Check if bigWig data should be used
 
-    for long_seq, seqs, label in seqs_information_generator:
+    for long_seq, seqs, label, weight in seqs_information_generator:
         sample_number = len(label)
         local_seq_cat_by_region = kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius=local_radius, local_order=1)
         # .values : convert DF to np.array, backward compatibility with previous code
         local_seq.append(local_seq_cat_by_region.values)
-        
+
         if local_order > 1:
             local_seq_cat_by_region = kmer_encoding_by_seqs(long_seq, seqs, sample_number, local_radius=local_radius, local_order=local_order)
             # .values : convert DF to np.array, backward compatibility with previous code
@@ -611,7 +612,8 @@ def prepare_local_feature(segments, ref_genome, local_radius, local_order, names
 
         # y.append(pd.DataFrame(label.reshape((-1,1)),columns = ['mut_type']))
         y.append(label)
-    
+        w.append(weight)
+
     if local_seq:
         seq_cols = ['us'+str(local_radius - i) for i in range(local_radius)] + ['mid'] + ['ds'+str(i+1) for i in range(local_radius)]
         local_seq = local_seq # (segment, sample_number, 2*local_radius+1), non-regular nested, each segment has different sample_number
@@ -636,6 +638,7 @@ def prepare_local_feature(segments, ref_genome, local_radius, local_order, names
         names[0]: local_seq,
         names[1]: local_seq_encode,
         names[2]: y,
+        'sample_weight': w,
     }
 
 
@@ -670,10 +673,11 @@ def seq_generator(bed_generator, ref_records, local_radius):
             if chrom != batch[0].chrom:
                 chrom = batch[0].chrom
                 long_seq = str(ref_records[chrom].seq)
-        
+
         seqs = list(get_seqs_to_digitalized(long_seq, batch, local_radius, stand))
         label = get_label(batch)
-        yield long_seq, seqs, label
+        weight = get_weight(batch)
+        yield long_seq, seqs, label, weight
 
 
 def local_digitalized_seqs_by_region(bed_regions, seq_records, central_bp, local_radius, local_order=1):
@@ -704,17 +708,17 @@ def local_digitalized_seqs_by_region(bed_regions, seq_records, central_bp, local
             if chrom != batch[0].chrom:
                 chrom = batch[0].chrom
                 long_seq = str(seq_records[chrom].seq)
-        
+
         batch_local_encoding = np.empty((len(batch),cat_n), dtype=np.int64)
         seqs = get_seqs_to_digitalized(long_seq, batch, local_radius, stand)
         digit_seqs = local_encoding_seqs(long_seq, seqs, local_radius, batch_local_encoding, local_order=local_order)
         digit_seqs = outlier_process(digit_seqs)
         digit_dataset.append(pd.DataFrame(digit_seqs,columns=seq_cols))
-        
+
         label = get_label(batch)
         y.append(pd.DataFrame(label.reshape((-1,1)),columns = ['mut_type']))
 
-        
+
     #digit_dataset = np.concatenate(digit_dataset)
     return digit_dataset,y 
 
@@ -949,6 +953,23 @@ def get_mean_bw_for_bed(bw_fh, bw_radii, bed_regions):
 def get_label(bed_regions):
     y = np.array([float(loc.score) for loc in bed_regions])
     return y
+
+def get_weight(bed_regions):
+    """Extract per-site count from BED name field (col4).
+    Format: 'chr1:238329;G>A;-1;1' — last field after ';' is count.
+    Non-mutated sites have name='.' → weight=1.0
+    """
+    weights = []
+    for loc in bed_regions:
+        if loc.name in ('.', '', 'na'):
+            weights.append(1.0)
+        else:
+            try:
+                count = float(loc.name.split(';')[-1])
+                weights.append(count)
+            except (ValueError, IndexError):
+                weights.append(1.0)
+    return np.array(weights, dtype=np.float32)
 #########################################################################
 #                          Construct Dataset Without HDF5 
 # 

@@ -311,7 +311,10 @@ def _match_exact(positions, features, query_positions):
 
     if not np.all(valid_mask):
         raise ValueError(f"Missing positions: {query_positions[~valid_mask]}")
-    return features[indices]
+    unique_indices, inverse_map = np.unique(indices, return_inverse=True)
+    unique_features = features[unique_indices]
+
+    return unique_features[inverse_map]
 
 def _match_nearest(positions, features, query_positions):
     def _find_nearest_indices(positions, query_positions):
@@ -805,13 +808,15 @@ def find_center_tree_in_list(position, tree_intervals_subset, original_indices):
 class PrecomputedFeatureSource(FeatureSource):
     def __init__(self, features: np.ndarray):
         self.features = features
-        if isinstance(features[0], (int, float)):
+        # 支持 numpy 数值类型 (np.float32, np.float64, np.int32, 等)
+        scalar_types = (int, float, np.integer, np.floating)
+        if isinstance(features[0], scalar_types):
             value = features[0]
         else:
             value = features[0][0]
         if isinstance(value, (list, np.ndarray)):
             self._n_channels = len(value)
-        elif isinstance(value, (int, float)):
+        elif isinstance(value, scalar_types):
             self._n_channels = 1
         else:
             raise ValueError(f"Unsupported feature value type: {type(value)}")
