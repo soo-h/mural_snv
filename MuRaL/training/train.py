@@ -8,7 +8,7 @@ from enum import Enum, auto
 
 import torch.nn as nn
 import torch.nn.functional as F
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, ContributionMinor, ContributionMinor2
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, ContributionMinor2
 
 class TrainerSubject:
     def __init__(self):
@@ -57,7 +57,7 @@ class BayesianTrainer(TrainerSubject):
 
         for observer in self.observer:
             self.register_observer(observer)
-        
+
         self.valid_preds_recoder = PredsRecoder()
         self.contribution_minor = ContributionMinor2(printer=printer)
         self.metrics = {}
@@ -167,8 +167,6 @@ class BayesianTrainer(TrainerSubject):
         # return valid_preds
         return pred_y_ensemble, pred_y_uncertain
 
-                
-
     def update_lr(self):
         if self.config['lr_scheduler'] != 'ROP':
             self.scheduler.step()
@@ -208,7 +206,7 @@ class BayesianTrainer(TrainerSubject):
             return preds
 
 class Trainer(TrainerSubject):
-    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print) -> None:
+    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, collect_mu_r=False) -> None:
 
         super().__init__()
 
@@ -232,10 +230,13 @@ class Trainer(TrainerSubject):
 
         for observer in self.observer:
             self.register_observer(observer)
-        
+
         self.valid_preds_recoder = PredsRecoder()
         self.contribution_minor = ContributionMinor2(printer=printer)
         self.metrics = {}
+
+        if collect_mu_r:
+            self._mu_r_recoder = MuRRecoder()
 
     def train_step(self, data_loader):
         self.model.train()
@@ -255,6 +256,7 @@ class Trainer(TrainerSubject):
             preds = self.model_train(inputs, self.model)
             # adapt preds to the loss calculator
             preds = self.preds_adapter.adapt(preds)
+
             losses = self.LossCalculator.calc_loss(preds, label, self.criterion, sample_weight)
             loss = self.LossCalculator.extract_total_loss()
             self.optimizer.zero_grad()
@@ -282,6 +284,8 @@ class Trainer(TrainerSubject):
     def valid_step(self, dataloader_valid):
         self.register_observer(self.valid_preds_recoder)
         self.register_observer(self.contribution_minor)
+        if hasattr(self, '_mu_r_recoder'):
+            self.register_observer(self._mu_r_recoder)
         self.model.eval()
         valid_step_time = time.time()
         with torch.no_grad():
@@ -299,7 +303,7 @@ class Trainer(TrainerSubject):
                                       sample_number = sample_number,
                                       valid_preds = valid_preds,
                                       label = label)
-            
+
             self.notify_observers(valid_step_finish = True)
         valid_step_time = time.time() - valid_step_time
         self.printer(f"Validation used time: {valid_step_time / 60} mins")
@@ -307,8 +311,14 @@ class Trainer(TrainerSubject):
 
         self.remove_observer(self.valid_preds_recoder)
         self.remove_observer(self.contribution_minor)
+        if hasattr(self, '_mu_r_recoder'):
+            self.remove_observer(self._mu_r_recoder)
         return valid_preds
-                
+
+    def get_mu_r(self):
+        if hasattr(self, '_mu_r_recoder'):
+            return self._mu_r_recoder.output()
+        return None, None
 
     def update_lr(self):
         if self.config['lr_scheduler'] != 'ROP':
@@ -477,16 +487,12 @@ class AdaptPreds:
         return self.adapter(preds)
 
     def no_adapt(self, preds):
+        if isinstance(preds, dict):
+            return preds, None
         return preds
-    
+
     def adapt_model3_AvgSegmentLabel_withGAN(self, preds):
-        local_out, middle_out, large_out, out = preds
-        return {
-                'local' : local_out,
-                'mid' : middle_out,
-                'distal' : large_out,
-                'out' : out
-            }
+        return preds, None
 
 @dataclass
 class BatchConfig:
@@ -537,15 +543,18 @@ STRATEGY_CONFIGS: Dict[str, BatchConfig] = {
 def get_inputs_labels(batch, strategy=None):
     """统一的batch处理函数"""
 
-    # 默认策略：原始4元素batch
+    # 默认策略：兼容 dict_to_tuple_collate 格式 (y, cat_x, distal_x, ...)
     if strategy is None:
-        # 检查是否有 sample_weight
-        if len(batch) == 5:
-            y, cont_x, cat_x, distal_x, sample_weight = batch
-            return y.long().squeeze(1), (cont_x, cat_x, distal_x), sample_weight
-        else:
-            y, cont_x, cat_x, distal_x = batch
-            return y.long().squeeze(1), (cont_x, cat_x, distal_x), None
+        batch_iter = iter(batch)
+        y = next(batch_iter)
+        cat_x = next(batch_iter)
+        distal_x = next(batch_iter)
+        sample_weight = None
+        try:
+            sample_weight = next(batch_iter)
+        except StopIteration:
+            pass
+        return {'label': _process_label(y)}, (0, cat_x, distal_x), sample_weight
 
     config = STRATEGY_CONFIGS.get(strategy)
     if config is None:

@@ -27,6 +27,11 @@ def parse_arguments(parser):
                             'observed mutation counts are derived from the '
                             'per-site count field instead of treating each '
                             'mutated site as a single event.')
+    parser.add_argument('--use_mu', default=False, action='store_true',
+                       help='Use mu columns (NB model mean) as predicted '
+                            'values instead of prob columns. Only valid for '
+                            'NB model prediction files. When the file has no '
+                            'mu columns, silently falls back to prob.')
     args = parser.parse_args()
     return args
 
@@ -180,10 +185,23 @@ def run_regional_corr_calc(args):
             print('WARNING: --recurrent is enabled but prediction file has no '
                   'info column. Falling back to count=1 for all sites.',
                   file=sys.stderr)
+        if args.use_mu:
+            if not header_info.get('has_mu', False):
+                print('WARNING: --use_mu is set but no mu columns found in '
+                      'prediction file. Falling back to prob columns.',
+                      file=sys.stderr)
+            elif header_info['n_mu'] != header_info['n_prob']:
+                raise ValueError(
+                    f"Number of mu columns ({header_info['n_mu']}) does not "
+                    f"match number of prob columns ({header_info['n_prob']}).")
+            else:
+                print('Using mu columns as predicted values for correlation '
+                      'calculation.', file=sys.stderr)
 
         for line in obs_file:
             line = line.strip().split('\t')
-            parsed = read_pred_line(line, header_info, recurrent=args.recurrent)
+            parsed = read_pred_line(line, header_info, recurrent=args.recurrent,
+                                    use_mu=args.use_mu)
             chrom = parsed['chrom']
             start = parsed['start']
             mut = parsed['mut_type']

@@ -37,7 +37,7 @@ from MuRaL.data.data_preprocess_pipeline import DatasetPreprocessor
 from MuRaL.data.dataset import dict_to_tuple_collate
 from pynvml import *
 
-from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory
+from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss
 from MuRaL.evaluation.observer import TimeMinor, LossMinor
 from MuRaL.training.predict import Predictor, BayesianPredictor
 
@@ -347,7 +347,8 @@ def main():
     preprocess_config.update(feature_config)
 
 
-    calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is None else args.calc_loss_strategy_name
+    # calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is None else args.calc_loss_strategy_name
+    calc_loss_strategy_name = args.calc_loss_strategy_name 
     print("calc_loss_strategy_name:", calc_loss_strategy_name)
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5)
     dataset_test = preprocessor_pipline.preprocess_dataset(args.test_data, args.ref_genome, use_segment_task=use_segment_task)
@@ -382,7 +383,13 @@ def main():
 
 
     # Loss function
-    criterion = torch.nn.CrossEntropyLoss(reduction='sum')
+    is_nb_model = '_nb' in str(config.get('model_no', ''))
+    if is_nb_model:
+        criterion = NegativeBinomialLoss(n_class=n_class, reduction='sum')
+        criterion.to(device)
+        print("Using NegativeBinomialLoss for NB model:", config.get('model_no'))
+    else:
+        criterion = torch.nn.CrossEntropyLoss(reduction='sum')
 
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=mix_loss)
 
@@ -392,18 +399,21 @@ def main():
                 LossMinor(calc_loss_strategy_name, printer=print)]
 
     if args.use_bayesian:
+        if is_nb_model:
+            print('Warning: Bayesian prediction is not supported for NB models. mu/r will not be collected.')
         config.update(const_bnn_prior_parameters)
         dnn_to_bnn(model, const_bnn_prior_parameters)
         # Load the saved model object
         model.load_state_dict(model_state)
         model.to(device)
-        predictor = BayesianPredictor(model, loss_calculator, criterion, device, config, 
+        predictor = BayesianPredictor(model, loss_calculator, criterion, device, config,
                       observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
     else:
         model.load_state_dict(model_state)
         model.to(device)
-        predictor = Predictor(model, loss_calculator, criterion, device, config, 
-                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
+        predictor = Predictor(model, loss_calculator, criterion, device, config,
+                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name,
+                      collect_mu_r=is_nb_model)
 
     print('model:')
     print(model)
@@ -412,8 +422,14 @@ def main():
     
 
     prob_names = ['prob'+str(i) for i in range(n_class)]
+    mu_names = ['mu'+str(i) for i in range(n_class)]
+    r_names = ['r'+str(i) for i in range(n_class)]
+
+    mu_df, r_df = None, None
 
     if out_each_model_preds:
+        if is_nb_model:
+            print('Warning: --save_each_model_preds is deprecated. NB-specific keys (mu, r, log_r) may appear in the output.')
         assert args.use_bayesian == False, "args.use_bayesian must be True when out_each_model_preds is False"
         pred_dict = predictor.predict_each_model(dataloader)
         out_each_model_preds = [
@@ -454,6 +470,19 @@ def main():
             y_prob = pd.DataFrame(data=to_np(F.softmax(pred_y, dim=1)), columns=prob_names)
             all_prob_names = prob_names
             dfs = [data_local_test, y_prob]
+
+            # collect mu/r for NB models
+            if is_nb_model:
+                valid_mu, valid_r = predictor.get_mu_r()
+                if valid_mu is not None:
+                    mu_df = pd.DataFrame(data=to_np(valid_mu), columns=mu_names)
+                    r_df = pd.DataFrame(data=to_np(valid_r), columns=r_names)
+                    dfs.extend([mu_df, r_df])
+                    print('mu stats:', to_np(valid_mu).mean(axis=0))
+                    print('r stats:', to_np(valid_r).mean(axis=0))
+                else:
+                    print('Warning: NB model did not output mu/r. Skipping mu/r collection.')
+
             # Print some data for debugging
             for i in range(1, n_class):
                 print('min and max of pred_y: type', i, np.min(to_np(F.softmax(pred_y, dim=1))[:,i]), np.max(to_np(F.softmax(pred_y, dim=1))[:,i]))
@@ -481,6 +510,8 @@ def main():
             'ERROR: mut_type mismatch between position info and prediction data. ' \
                 'BED file or data pipeline may have inconsistent ordering.'
     pred_df = pd.concat((chr_pos, y_prob), axis=1)
+    if mu_df is not None and r_df is not None:
+        pred_df = pd.concat((pred_df, mu_df, r_df), axis=1)
     pred_df.sort_values(['chrom', 'start'], inplace=True)
     pred_df.reset_index(drop=True, inplace=True)
     # 输出文件包含info列

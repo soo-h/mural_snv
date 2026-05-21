@@ -528,9 +528,10 @@ class Network2(nn.Module):
 
 class Network3(nn.Module):
     """Combined model with FeedForward and ResNet componets"""
-    def __init__(self,  emb_dims, no_of_cont, lin_layer_sizes, emb_dropout, lin_layer_dropouts, in_channels, out_channels, kernel_size, distal_radius, distal_order, distal_fc_dropout, n_class, 
+    def __init__(self,  emb_dims, no_of_cont, lin_layer_sizes, emb_dropout, lin_layer_dropouts, in_channels, out_channels, kernel_size, distal_radius, distal_order, distal_fc_dropout, n_class,
                  emb_padding_idx=None,
-                 bspline=False):
+                 bspline=False,
+                 fused_type='prob'):
         """  
         Args:
             emb_dims: embedding dimensions
@@ -549,9 +550,10 @@ class Network3(nn.Module):
         """
         
         super(Network3, self).__init__()
-        
+
         self.n_class = n_class
         self.in_channels = in_channels
+        self.fused_type = fused_type
         
         # FeedForward layers for local input
         # Embedding layers
@@ -694,20 +696,35 @@ class Network3(nn.Module):
                 nn.BatchNorm1d(self.no_of_cont),
                 nn.Dropout(lin_layer_dropouts[0]),
                 nn.Linear(self.no_of_cont, n_class), 
-            ) 
-    
+            )
+
+    def _fuse_logits(self, local_out, local_out2, local_out3, distal_out, distal_out2):
+        """Average logits directly"""
+        outputs = [local_out, local_out2, local_out3, distal_out, distal_out2]
+        outputs = [o for o in outputs if o is not None]
+        fused = torch.stack(outputs, dim=0).mean(dim=0)
+        return fused
+
+    def _fuse_prob(self, local_out, local_out2, local_out3, distal_out, distal_out2):
+        """Softmax each logit input -> average in prob space -> log(clamp) back to logits"""
+        outputs = [local_out, local_out2, local_out3, distal_out, distal_out2]
+        outputs = [o for o in outputs if o is not None]
+        probs = [F.softmax(o, dim=1) for o in outputs]
+        fused = torch.stack(probs, dim=0).mean(dim=0)
+        return torch.log(torch.clamp(fused, min=1e-9))
+
     def forward(self, local_input, distal_input):
         """
         Forward pass
-        
+
         Args:
             local_input: local input
             distal_input: distal input
         """
-        
+
         # FeedForward layers for local input
         cont_data, cat_data = local_input
-        
+
         if self.no_of_embs != 0:
             local_out = [self.emb_layer(cat_data[:, i]) for i in range(self.no_of_cat)]
             
@@ -784,34 +801,20 @@ class Network3(nn.Module):
 
         distal_out2 = self.distal_fc2(distal_out2)
 
-        middle_out = F.softmax(distal_out, dim=1)
-        large_out = F.softmax(distal_out2, dim=1)
-        
-        
-        #distal_out = torch.log((F.softmax(mid_out1, dim=1) +F.softmax(mid_out2, dim=1) + F.softmax(distal_out, dim=1))/3)
-        #distal_out = torch.log((F.softmax(distal_out, dim=1)+ F.softmax(distal_out2, dim=1))/2)
-        distal_out = (F.softmax(distal_out, dim=1) + F.softmax(distal_out2, dim=1))/2
-        local_out = F.softmax(local_out, dim=1)
-        
-        if self.no_of_cont > 0:
-            local_out2 = F.softmax(local_out2, dim=1)
-        
+        # All sub-model outputs are logits
         if self.training == False and np.random.uniform(0,1) < 0.00001*local_out.shape[0]:
             print('local_out1:', torch.min(local_out[:,1]).item(), torch.max(local_out[:,1]).item(), torch.var(local_out[:,1]).item())
             if self.no_of_cont > 0:
                 print('local_out2:', torch.min(local_out2[:,1]).item(), torch.max(local_out2[:,1]).item(), torch.var(local_out2[:,1]).item())
             print('distal_out1:', torch.min(distal_out[:,1]).item(), torch.max(distal_out[:,1]).item(),torch.var(distal_out[:,1]).item())
 
-        
-        #out = torch.log(torch.clamp((local_out + distal_out)/2*local_out2, min=1e-9))  
+        fusion_fn = self._fuse_logits if self.fused_type == "logit" else self._fuse_prob
         if self.no_of_cont > 0:
-            out = torch.log(torch.clamp((local_out + distal_out + local_out2)/3, min=1e-9))
-            return local_out, local_out2,   distal_out, out
+            out = fusion_fn(local_out, local_out2, None, distal_out, distal_out2)
+            return {'local': local_out, 'local2': local_out2, 'mid': distal_out, 'distal': distal_out2, 'out': out}, None
         else:
-            out = torch.log(torch.clamp((local_out + distal_out)/2, min=1e-9))
-            return local_out, middle_out, large_out, out
-        
-        return local_out, middle_out, large_out, out
+            out = fusion_fn(local_out, None, None, distal_out, distal_out2)
+            return {'local': local_out, 'mid': distal_out, 'distal': distal_out2, 'out': out}, None
 
 
 # Residual block (according to Jaganathan et al. 2019 Cell)

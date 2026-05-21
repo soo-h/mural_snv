@@ -472,7 +472,7 @@ class LossMinor(Observer):
 
     def __init__(self, calc_loss_strategy_name=None, printer=print):
         if calc_loss_strategy_name is None:
-            self.loss_strategy = AdaptiveLossMinorStrategy()
+            self.loss_strategy = AdaptiveLossStrategyLossMinorStrategy()
 
         else:
             if calc_loss_strategy_name not in self.strategy_map:
@@ -568,6 +568,42 @@ class PredsRecoder(Observer):
         if 'valid_preds' in kwargs:
             preds = kwargs['valid_preds']
             self.recode(preds)
+
+
+class MuRRecoder(Observer):
+    """收集 predict_out 中的 mu 和 r（已激活的 NB 参数），供 validation 评估使用。
+
+    通过 Trainer 的 collect_mu_r flag 内部注册，生命周期与 valid_preds_recoder 一致。
+    调用方通过 Trainer.get_mu_r() 获取结果。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mu = None
+        self.r = None
+
+    def reset(self):
+        self.mu = None
+        self.r = None
+
+    def recode(self, preds):
+        predict_out, _ = preds if isinstance(preds, tuple) else (preds, None)
+        mu = predict_out.get('mu')
+        r = predict_out.get('r')
+        if mu is None:
+            return  # CE 模型没有 mu/r，静默跳过
+        batch_size = mu.shape[0]
+        self.mu = mu if self.mu is None else torch.cat([self.mu, mu], dim=0)
+        self.r = r if self.r is None else torch.cat([self.r, r], dim=0)
+
+    def output(self):
+        mu, r = self.mu, self.r
+        self.reset()
+        return mu, r
+
+    def update(self, **kwargs):
+        if 'valid_preds' in kwargs:
+            self.recode(kwargs['valid_preds'])
 
 
 class SubModelPredResRecoder(Observer):

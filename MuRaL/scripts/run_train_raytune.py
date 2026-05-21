@@ -163,7 +163,7 @@ def parse_arguments(parser):
         Load model from a checkpoint file. Default: None.
         """).strip())
                             
-    model_args.add_argument('--model_no', type=int, metavar='INT', default=2, 
+    model_args.add_argument('--model_no', type=str, metavar='STR', default='2',
                           help=textwrap.dedent("""
                           Which network architecture to be used: 
                           0 - 'local-only' model;
@@ -194,6 +194,11 @@ def parse_arguments(parser):
                             default=None)
 
     model_args.add_argument('--calc_loss_strategy_name', type=str, default=None)
+
+    model_args.add_argument('--loss_name', type=str, default=None,
+                          help=textwrap.dedent("""
+                          Loss function name. Options: CrossEntropy (default), NegBinomial.
+                          Default: None (CrossEntropy).""").strip())
 
     model_args.add_argument('--use_dilation', 
                             default=False, 

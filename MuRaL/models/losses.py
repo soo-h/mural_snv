@@ -1,19 +1,65 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import sys
 import inspect
+
+
+class NegativeBinomialLoss(nn.Module):
+    """负二项分布负对数似然损失。
+
+    μ 和 r 必须由模型通过 forward 输出已激活的正值。
+    Loss 自身不维护可学习参数，仅计算 NLL 公式。
+    """
+
+    def __init__(self, n_class, reduction='sum'):
+        super().__init__()
+        self.n_class = n_class
+        self.reduction = reduction
+
+    def forward(self, mu, target, r):
+        """
+        Args:
+            mu: 模型已激活的 μ（正值，[batch, n_class]）
+            target: 类别索引 [batch] 或已处理计数 [batch, n_class]
+            r: 模型已激活的 r（正值，[batch, n_class]）
+        """
+        if target.dim() == 1:
+            target = F.one_hot(target, self.n_class).float()
+
+        # NLL = -log P
+        nll = (
+            -torch.lgamma(target + r)
+            + torch.lgamma(r)
+            + torch.lgamma(target + 1)
+            + target * torch.log1p(r / (mu + 1e-8))
+            + r * torch.log1p(mu / (r + 1e-8))
+        )
+
+        if self.reduction == 'sum':
+            return nll.sum()
+        elif self.reduction == 'mean':
+            return nll.mean()
+        return nll
 
 
 class LossFactory():
     def __init__(self) -> None:
         pass
 
-    def create_loss(self, loss_name=None, use_sample_weight=False):
-        if loss_name is None:
+    def create_loss(self, loss_name=None, use_sample_weight=False, n_class=None):
+        if loss_name is None or loss_name == 'CrossEntropy':
             if use_sample_weight:
                 return torch.nn.CrossEntropyLoss(reduction='none')
             else:
                 return torch.nn.CrossEntropyLoss(reduction='sum')
+        elif loss_name == 'NegBinomial':
+            if n_class is None:
+                raise ValueError("n_class is required for NegBinomial loss")
+            # NB loss 始终用 reduction='sum'，sample_weight 语义由调用方处理
+            return NegativeBinomialLoss(n_class=n_class, reduction='sum')
+        else:
+            raise ValueError(f"Unknown loss_name: {loss_name}")
 
 def compute_local_distal_loss(preds, y, criterion):
     preds_local, preds_distal, preds = preds
@@ -73,7 +119,7 @@ class LossCalcStrategyFactory:
         #     return loss_calc_startegy_name[strategy_name]()
         # adapt Original test
         if strategy_name is None:
-            selected_class = AdaptiveLossStrategy
+            selected_class = AdaptiveLossStrategy2
         elif strategy_name in loss_calc_strategy_name:
             selected_class = loss_calc_strategy_name[strategy_name]
         else:
@@ -158,44 +204,71 @@ class AdaptiveLossStrategy2():
 
         y = labels.get('label')
 
+        is_nb_loss = isinstance(criterion, NegativeBinomialLoss)
+        if is_nb_loss:
+            mu = preds.get('mu')
+            r = preds.get('r')
+            if mu is None or r is None:
+                raise ValueError(
+                    "NegativeBinomialLoss requires model to output 'mu' and 'r'. "
+                    "Use a model with r_head (127_nb, 127_nb_v2, 127_nb_v3, etc.)."
+                )
+
         # 辅助函数：计算加权或普通损失
-        def _calc_loss(pred, target):
-            if pred is None:
+        def _calc_loss(pred_or_mu, target, r=None):
+            if pred_or_mu is None:
                 return None
-            loss = criterion(pred, target)
+            if is_nb_loss:
+                # sample_weight 语义：替换 one-hot 中的计数
+                if sample_weight is not None:
+                    target = F.one_hot(target, criterion.n_class).float()
+                    target = target * sample_weight.unsqueeze(-1)
+                return criterion(pred_or_mu, target, r)
+            loss = criterion(pred_or_mu, target)
             if sample_weight is not None and loss.dim() > 0:
-                # 如果 criterion 返回的是逐样本损失（reduction='none'）
                 return (loss * sample_weight.squeeze()).sum()
             return loss
 
-        mid = preds.get('mid')
-        distal = preds.get('distal')
-        out = preds.get('out')
+        if is_nb_loss:
+            # NB loss：只有 out 有已激活的 mu/r，其余子模型输出 raw logits → None
+            loss = _calc_loss(mu, y, r=r)
+            loss_local1 = _calc_loss(None, y)
+            loss_local2 = _calc_loss(None, y)
+            loss_local3 = _calc_loss(None, y)
+            loss_mid = _calc_loss(None, y)
+            loss_distal = _calc_loss(None, y)
+            loss_arg_feature = _calc_loss(None, y)
+            loss_dual_head = 0
+        else:
+            # CE loss：分量正常计算
+            mid = preds.get('mid')
+            distal = preds.get('distal')
+            out = preds.get('out')
 
-        local1 = preds.get('local')
-        loss_local1 = _calc_loss(local1, y)
+            local1 = preds.get('local')
+            loss_local1 = _calc_loss(local1, y)
 
-        local2 = preds.get('local2')
-        loss_local2 = _calc_loss(local2, y)
+            local2 = preds.get('local2')
+            loss_local2 = _calc_loss(local2, y)
 
-        local3 = preds.get('local3')
-        loss_local3 = _calc_loss(local3, y)
+            local3 = preds.get('local3')
+            loss_local3 = _calc_loss(local3, y)
 
-        loss_mid = _calc_loss(mid, y)
+            loss_mid = _calc_loss(mid, y)
 
-        loss_distal = _calc_loss(distal, y)
+            loss_distal = _calc_loss(distal, y)
 
-        arg_feature = preds.get('arg_feature')
-        loss_arg_feature = _calc_loss(arg_feature, y)
+            arg_feature = preds.get('arg_feature')
+            loss_arg_feature = _calc_loss(arg_feature, y)
 
-        loss_dual_head = 0
-        if 'local_h1' in preds:
-            assert 'local_h2' in preds, "Both local_h1 and local_h2 should be present"
-            loss_local_h1 = _calc_loss(preds['local_h1'], self._to_h1_label(y))
-            loss_local_h2 = _calc_loss(preds['local_h2'], self._to_h2_label(y))
-            loss_dual_head = loss_local_h1 + loss_local_h2
+            loss_dual_head = 0
+            if 'local_h1' in preds:
+                assert 'local_h2' in preds, "Both local_h1 and local_h2 should be present"
+                loss_local_h1 = _calc_loss(preds['local_h1'], self._to_h1_label(y))
+                loss_local_h2 = _calc_loss(preds['local_h2'], self._to_h2_label(y))
+                loss_dual_head = loss_local_h1 + loss_local_h2
 
-        loss = _calc_loss(out, y)
+            loss = _calc_loss(out, y)
 
         self.total_loss = loss + 0.25 * loss_dual_head
 

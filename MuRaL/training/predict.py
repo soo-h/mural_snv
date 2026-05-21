@@ -2,14 +2,14 @@ import torch
 import time
 
 import torch.nn.functional as F
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2
 from MuRaL.training.train import TrainerSubject, get_inputs_labels, model_train_register
 
 
 
 
 class Predictor(TrainerSubject):
-    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False) -> None:
+    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False, collect_mu_r=False) -> None:
 
         super().__init__()
 
@@ -21,6 +21,7 @@ class Predictor(TrainerSubject):
         self.printer = printer
         self.train_strategy = train_strategy
         self.detach = detach
+        self.collect_mu_r = collect_mu_r
 
         if observer is None:
             self.observer = [TimeMinor(out_after_n_batch=1000),LossMinor()]
@@ -29,16 +30,20 @@ class Predictor(TrainerSubject):
 
         for observer in self.observer:
             self.register_observer(observer)
-        
+
         self.valid_preds_recoder = PredsRecoder()
         self.each_model_preds_recoder = SubModelPredResRecoder()
         self.contribution_minor = ContributionMinor2()
         self.contribution_minor_split_mut_type = ContributionMinor2()
         self.metrics = {}
+        if collect_mu_r:
+            self._mu_r_recoder = MuRRecoder()
 
     def predict(self, dataloader_test):
         self.register_observer(self.valid_preds_recoder)
         self.register_observer(self.contribution_minor)
+        if self.collect_mu_r:
+            self.register_observer(self._mu_r_recoder)
         self.model.eval()
         valid_step_time = time.time()
         with torch.no_grad():
@@ -55,7 +60,7 @@ class Predictor(TrainerSubject):
                                       sample_number = sample_number,
                                       valid_preds = valid_preds,
                                       label=label)
-            
+
             self.notify_observers(valid_step_finish = True)
         valid_step_time = time.time() - valid_step_time
         self.printer(f"Validation used time: {valid_step_time / 60} mins")
@@ -63,6 +68,8 @@ class Predictor(TrainerSubject):
 
         self.remove_observer(self.valid_preds_recoder)
         self.remove_observer(self.contribution_minor)
+        if self.collect_mu_r:
+            self.remove_observer(self._mu_r_recoder)
         return valid_preds
     
     def predict_each_model(self, dataloader_test):
@@ -103,6 +110,16 @@ class Predictor(TrainerSubject):
             return [v.to(device) for v in batch]
         else:
             return batch.to(device)
+
+    def get_mu_r(self):
+        """返回收集的 mu 和 r（已激活的正值）。
+
+        仅当 collect_mu_r=True 且模型为 NB variant 时返回有效值。
+        CE 模型返回 (None, None)。
+        """
+        if hasattr(self, '_mu_r_recoder'):
+            return self._mu_r_recoder.output()
+        return None, None
 
 def model_predict(batch, model, detach, strategy):
     if detach:

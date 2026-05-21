@@ -28,7 +28,7 @@ from MuRaL.evaluation.evaluation import *
 from MuRaL.data.preprocessing import *
 from MuRaL.data.dataset import dict_to_tuple_collate
 from MuRaL.models.custom_loss import *
-from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory
+from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
 from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor
@@ -98,12 +98,14 @@ def train(config, args, checkpoint_dir=None):
 
     feature_config = read_feature_config(args.feature_config)
     # two sequence features must used: local and distal
-    use_segment_task = True if len(feature_config['features']) > 2 else False
+    use_segment_task = True if (len(feature_config['features']) > 2 or args.use_segment_task) else False
     print("use_segment_task:", use_segment_task)
 
     preprocess_config.update(feature_config)
     preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5, printer=print)
-    calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is None else args.calc_loss_strategy_name
+    # 2026.0516
+    calc_loss_strategy_name = args.calc_loss_strategy_name 
+    # calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is None else args.calc_loss_strategy_name
     # (2025.12.18 to do): 根据config中是否包含sequence外的feature决定segment task是True or False
     dataset = preprocessor_pipline.preprocess_dataset(args.train_data, args.ref_genome, use_segment_task=use_segment_task)
 
@@ -174,10 +176,23 @@ def train(config, args, checkpoint_dir=None):
 
     # loss and optimizer
     loss_factory = LossFactory()
-    criterion = loss_factory.create_loss(use_sample_weight=args.recurrent)
+
+    criterion = loss_factory.create_loss(
+        loss_name=args.loss_name,
+        use_sample_weight=args.recurrent,
+        n_class=n_class,
+    )
+    is_nb = isinstance(criterion, NegativeBinomialLoss)
+    if is_nb:
+        if '_nb' not in str(args.model_no):
+            raise ValueError(
+                f"NegativeBinomialLoss requires an NB model variant "
+                f"(e.g. 127_nb, 151_nb, 3_nb), but got model_no={args.model_no}"
+            )
+        criterion.to(device)
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=args.mix_loss)
 
-    config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto, config['weight_decay']) 
+    config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto, config['weight_decay'])
     optimizer = get_optimizer(config['optim'], model, config['learning_rate'], config['weight_decay'])
     scheduler = get_lr_scheduler(config['lr_scheduler'], optimizer, train_size, config)
 
@@ -204,8 +219,9 @@ def train(config, args, checkpoint_dir=None):
         trainer = BayesianTrainer(model, optimizer, scheduler, loss_calculator, criterion, device, config,
                                   observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
     else:
-        trainer = Trainer(model, optimizer, scheduler, loss_calculator, criterion, device, config, 
-                          observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
+        trainer = Trainer(model, optimizer, scheduler, loss_calculator, criterion, device, config,
+                          observer=Observer, printer=print, train_strategy=calc_loss_strategy_name,
+                          collect_mu_r=is_nb)
 
     if not args.use_ray:
         early_stopping = EarlyStopping(patience=args.grace_period, verbose=True)
@@ -226,10 +242,17 @@ def train(config, args, checkpoint_dir=None):
             valid_y_prob = to_np(F.softmax(valid_pred_y, dim=1))
         valid_y = data_local_valid['mut_type'].to_numpy().squeeze()
 
+        # Extract mu/r for NB models
+        valid_mu, valid_r = None, None
+        if is_nb:
+            valid_mu_t, valid_r_t = trainer.get_mu_r()
+            if valid_mu_t is not None:
+                valid_mu = to_np(valid_mu_t)
+                valid_r = to_np(valid_r_t)
+
         # calibrate
         if args.recurrent:
             weights = data_local_valid['sample_weight'].values.astype(int)
-            # 按count展开验证集
             indices = np.repeat(np.arange(len(weights)), np.maximum(weights, 1).astype(int))
             valid_y_prob_expanded = valid_y_prob[indices]
             valid_y_expanded = valid_y[indices]
@@ -243,11 +266,19 @@ def train(config, args, checkpoint_dir=None):
             report_ac_prob_correlation(valid_y_prob, n_class=n_class, n_sub=n_sub)
 
         # Evaluation- Kmer
-        evaluator_before_calibra = Evaluator(data_local_valid, valid_y_prob, n_class, use_obs_count=args.recurrent, printer=print)
-        evaluator_after_calibra = Evaluator(data_local_valid, prob_cal, n_class, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
+        if is_nb:
+            evaluator_before_calibra = NBEvaluator(data_local_valid, valid_y_prob, n_class, mu=valid_mu, r=valid_r, use_obs_count=args.recurrent, printer=print)
+            evaluator_after_calibra = NBEvaluator(data_local_valid, prob_cal, n_class, mu=valid_mu, r=valid_r, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
+        else:
+            evaluator_before_calibra = Evaluator(data_local_valid, valid_y_prob, n_class, use_obs_count=args.recurrent, printer=print)
+            evaluator_after_calibra = Evaluator(data_local_valid, prob_cal, n_class, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
 
         evaluator_before_calibra.evaluate_kmer()
         evaluator_after_calibra.evaluate_kmer()
+
+        if is_nb:
+            evaluator_before_calibra.evaluate_kmer_var(kmer_list=[3])
+            evaluator_after_calibra.evaluate_kmer_var()
 
         evaluator_before_calibra.evaluate_regional_score(valid_size)
         evaluator_after_calibra.evaluate_regional_score(valid_size)
@@ -454,7 +485,44 @@ class Evaluator:
             self.printer('regional score(after fdiri_cal)', score, n_regions)
         
         self.metrics['score'] = score
-        
+
+
+class NBEvaluator(Evaluator):
+    """Evaluator 子类，增加 μ、r、方差评估。"""
+
+    def __init__(self, data_local, y_prob, n_class, mu=None, r=None, calibra=None, use_obs_count=False, printer=print):
+        super().__init__(data_local, y_prob, n_class, calibra=calibra, use_obs_count=use_obs_count, printer=printer)
+
+        self.mu_names = ['mu'+str(i) for i in range(n_class)]
+        self.r_names = ['r'+str(i) for i in range(n_class)]
+        self.var_names = ['var'+str(i) for i in range(n_class)]
+
+        if mu is not None:
+            mu_df = pd.DataFrame(mu, columns=self.mu_names)
+            r_df = pd.DataFrame(r, columns=self.r_names)
+            # Var = μ + μ²/r
+            var = mu + mu**2 / np.maximum(r, 1e-8)
+            self.printer("calc mu by NegBinomial: ", mu.mean(axis=0))
+            self.printer("calc r by NegBinomial: ", r.mean(axis=0))
+            self.printer("calc var by NegBinomial: ", var.mean(axis=0))
+            var_df = pd.DataFrame(var, columns=self.var_names)
+            self.data_and_prob = pd.concat([self.data_and_prob, mu_df, r_df, var_df], axis=1)
+
+    def evaluate_kmer_var(self, kmer_list=[3]):
+        """按 k-mer 聚合 μ、r、方差，输出每类均值。"""
+        if not hasattr(self, 'mu_names'):
+            self.printer("NBEvaluator: no mu/r data, skip evaluate_kmer_var.")
+            return
+
+        for k in kmer_list:
+            d = k // 2
+            mer_list = ['us'+str(i) for i in range(d, 0, -1)] + ['ds'+str(i) for i in range(1, d+1)]
+
+            grouped = self.data_and_prob.groupby(mer_list)
+            result = grouped[self.mu_names + self.r_names + self.var_names].mean()
+
+            self.printer(f"\n--- {k}mer μ/r/var ---")
+            self.printer(result)
 
 def save_model(model, fdiri_cal, config, save_path):
     """Save model state, fdiri_cal, config and validation predictions to the specified path."""
