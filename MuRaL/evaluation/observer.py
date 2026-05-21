@@ -606,6 +606,43 @@ class MuRRecoder(Observer):
             self.recode(kwargs['valid_preds'])
 
 
+class EvidenceRecoder(Observer):
+    """Collect pi_logits/alpha_raw during validation and compute evidence.
+
+    Used by Dirichlet MDN models. Activated via Trainer(collect_evidence=True).
+    Caller retrieves evidence via Trainer.get_evidence().
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.evidence = None
+
+    def reset(self):
+        self.evidence = None
+
+    def recode(self, preds):
+        predict_out, _ = preds if isinstance(preds, tuple) else (preds, None)
+        if 'pi_logits' not in predict_out:
+            return
+        from MuRaL.models.dirichlet_mdn_model import dirichlet_mdn_predict_from_output
+        with torch.no_grad():
+            result = dirichlet_mdn_predict_from_output(predict_out)
+            ev = result['evidence'].detach().cpu()
+        self.evidence = (
+            ev if self.evidence is None
+            else torch.cat([self.evidence, ev], dim=0)
+        )
+
+    def output(self):
+        ev = self.evidence
+        self.reset()
+        return ev
+
+    def update(self, **kwargs):
+        if 'valid_preds' in kwargs:
+            self.recode(kwargs['valid_preds'])
+
+
 class SubModelPredResRecoder(Observer):
     def __init__(self):
         # 使用字典统一管理模型结果，便于扩展

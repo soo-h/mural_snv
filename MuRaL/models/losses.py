@@ -43,6 +43,97 @@ class NegativeBinomialLoss(nn.Module):
         return nll
 
 
+class DirichletMDNClassificationLoss(nn.Module):
+    """Dirichlet-MDN classification loss.
+
+    Model outputs raw pi_logits and alpha_raw; loss applies activation
+    internally (log_softmax for pi, softplus for alpha).
+
+    Supports 2 pred formats:
+      - dict with keys 'pi_logits' and 'alpha_raw'
+      - tuple (pi_logits, alpha_raw)
+    """
+
+    def __init__(
+        self,
+        eps: float = 1e-8,
+        evidence_reg: float = 0.0,
+        entropy_reg: float = 0.0,
+        reduction: str = 'sum',
+    ):
+        super().__init__()
+        self.eps = eps
+        self.evidence_reg = evidence_reg
+        self.entropy_reg = entropy_reg
+        self.reduction = reduction
+
+    def forward(self, pred, y):
+        pi_logits, alpha_raw = self._unpack_pred(pred)
+        B, K, C = alpha_raw.shape
+
+        # Activation: log_softmax for pi (numerically stable)
+        log_pi = F.log_softmax(pi_logits, dim=1)      # (B, K)
+        pi = log_pi.exp()                              # (B, K), exact softmax
+
+        # Activation: softplus for alpha (ensure > 0)
+        alpha = F.softplus(alpha_raw) + self.eps       # (B, K, C)
+
+        # log Dirichlet mean probability per component
+        alpha_sum = alpha.sum(dim=-1, keepdim=True)    # (B, K, 1)
+        log_p_k = torch.log(alpha + self.eps) - torch.log(alpha_sum + self.eps)
+
+        # Select true class log-prob for each component
+        y_idx = y.view(B, 1, 1).expand(B, K, 1)        # (B, K, 1)
+        log_p_y = log_p_k.gather(dim=2, index=y_idx).squeeze(2)  # (B, K)
+
+        # log p(y) = logsumexp(log_pi + log_p_k(y))
+        log_likelihood = torch.logsumexp(log_pi + log_p_y, dim=1)  # (B,)
+        nll_loss = -log_likelihood
+
+        # Reduction
+        if self.reduction == 'mean':
+            nll_loss = nll_loss.mean()
+        elif self.reduction == 'sum':
+            nll_loss = nll_loss.sum()
+        elif self.reduction != 'none':
+            raise ValueError(f"Unknown reduction: {self.reduction}")
+
+        loss = nll_loss
+
+        # Evidence regularizer: scale aligned with NLL
+        if self.evidence_reg > 0:
+            evidence = alpha.sum(dim=-1)               # (B, K)
+            if self.reduction == 'sum':
+                reg = evidence.sum() / K
+            else:
+                reg = evidence.mean()
+            loss = loss + self.evidence_reg * reg
+
+        # Entropy regularizer: scale aligned with NLL
+        if self.entropy_reg > 0:
+            per_sample_entropy = -(pi * log_pi).sum(dim=1)  # (B,)
+            if self.reduction == 'sum':
+                entropy = per_sample_entropy.sum()
+            else:
+                entropy = per_sample_entropy.mean()
+            loss = loss - self.entropy_reg * entropy
+
+        return loss
+
+    @staticmethod
+    def _unpack_pred(pred):
+        if isinstance(pred, dict):
+            return pred['pi_logits'], pred['alpha_raw']
+        if isinstance(pred, (tuple, list)):
+            if len(pred) != 2:
+                raise ValueError("Tuple pred should be (pi_logits, alpha_raw).")
+            return pred[0], pred[1]
+        raise TypeError(
+            "pred should be dict with keys ['pi_logits', 'alpha_raw'] "
+            "or tuple (pi_logits, alpha_raw)."
+        )
+
+
 class LossFactory():
     def __init__(self) -> None:
         pass
@@ -58,6 +149,8 @@ class LossFactory():
                 raise ValueError("n_class is required for NegBinomial loss")
             # NB loss 始终用 reduction='sum'，sample_weight 语义由调用方处理
             return NegativeBinomialLoss(n_class=n_class, reduction='sum')
+        elif loss_name == 'DirichletMDN':
+            return DirichletMDNClassificationLoss(reduction='sum')
         else:
             raise ValueError(f"Unknown loss_name: {loss_name}")
 
@@ -205,6 +298,7 @@ class AdaptiveLossStrategy2():
         y = labels.get('label')
 
         is_nb_loss = isinstance(criterion, NegativeBinomialLoss)
+        is_dir_mdn = isinstance(criterion, DirichletMDNClassificationLoss)
         if is_nb_loss:
             mu = preds.get('mu')
             r = preds.get('r')
@@ -229,7 +323,14 @@ class AdaptiveLossStrategy2():
                 return (loss * sample_weight.squeeze()).sum()
             return loss
 
-        if is_nb_loss:
+        if is_dir_mdn:
+            # Dirichlet MDN loss：preds dict 直接传给 criterion
+            loss = criterion(preds, y)
+            loss_local1 = loss_local2 = loss_local3 = None
+            loss_mid = loss_distal = None
+            loss_arg_feature = None
+            loss_dual_head = 0
+        elif is_nb_loss:
             # NB loss：只有 out 有已激活的 mu/r，其余子模型输出 raw logits → None
             loss = _calc_loss(mu, y, r=r)
             loss_local1 = _calc_loss(None, y)

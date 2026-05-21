@@ -28,10 +28,10 @@ from MuRaL.evaluation.evaluation import *
 from MuRaL.data.preprocessing import *
 from MuRaL.data.dataset import dict_to_tuple_collate
 from MuRaL.models.custom_loss import *
-from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss
+from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
 from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, EvidenceRecoder
 from MuRaL.utils.config_utils import read_bnn_config, read_feature_config
 
 sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
@@ -190,6 +190,13 @@ def train(config, args, checkpoint_dir=None):
                 f"(e.g. 127_nb, 151_nb, 3_nb), but got model_no={args.model_no}"
             )
         criterion.to(device)
+    is_dir_mdn = isinstance(criterion, DirichletMDNClassificationLoss)
+    if is_dir_mdn:
+        if '_dir_mdn' not in str(args.model_no):
+            raise ValueError(
+                f"DirichletMDN loss requires a DirMDN model variant "
+                f"(e.g. 151_dir_mdn), but got model_no={args.model_no}"
+            )
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=args.mix_loss)
 
     config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto, config['weight_decay'])
@@ -223,6 +230,8 @@ def train(config, args, checkpoint_dir=None):
                           observer=Observer, printer=print, train_strategy=calc_loss_strategy_name,
                           collect_mu_r=is_nb)
 
+    evidence_recoder = EvidenceRecoder() if is_dir_mdn else None
+
     if not args.use_ray:
         early_stopping = EarlyStopping(patience=args.grace_period, verbose=True)
 
@@ -238,6 +247,8 @@ def train(config, args, checkpoint_dir=None):
             print("valid_y_std 0:10 :", valid_y_std[:10])
         
         else:
+            if is_dir_mdn:
+                trainer.register_observer(evidence_recoder)
             valid_pred_y = trainer.valid_step(dataloader_valid)
             valid_y_prob = to_np(F.softmax(valid_pred_y, dim=1))
         valid_y = data_local_valid['mut_type'].to_numpy().squeeze()
@@ -249,6 +260,14 @@ def train(config, args, checkpoint_dir=None):
             if valid_mu_t is not None:
                 valid_mu = to_np(valid_mu_t)
                 valid_r = to_np(valid_r_t)
+
+        # Extract evidence for DirMDN models
+        valid_evidence = None
+        if is_dir_mdn:
+            valid_evidence_t = evidence_recoder.output()
+            if valid_evidence_t is not None:
+                valid_evidence = to_np(valid_evidence_t)
+            trainer.remove_observer(evidence_recoder)
 
         # calibrate
         if args.recurrent:
@@ -269,6 +288,9 @@ def train(config, args, checkpoint_dir=None):
         if is_nb:
             evaluator_before_calibra = NBEvaluator(data_local_valid, valid_y_prob, n_class, mu=valid_mu, r=valid_r, use_obs_count=args.recurrent, printer=print)
             evaluator_after_calibra = NBEvaluator(data_local_valid, prob_cal, n_class, mu=valid_mu, r=valid_r, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
+        elif is_dir_mdn:
+            evaluator_before_calibra = DirMDNEvaluator(data_local_valid, valid_y_prob, n_class, evidence=valid_evidence, use_obs_count=args.recurrent, printer=print)
+            evaluator_after_calibra = DirMDNEvaluator(data_local_valid, prob_cal, n_class, evidence=valid_evidence, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
         else:
             evaluator_before_calibra = Evaluator(data_local_valid, valid_y_prob, n_class, use_obs_count=args.recurrent, printer=print)
             evaluator_after_calibra = Evaluator(data_local_valid, prob_cal, n_class, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
@@ -279,6 +301,11 @@ def train(config, args, checkpoint_dir=None):
         if is_nb:
             evaluator_before_calibra.evaluate_kmer_var(kmer_list=[3])
             evaluator_after_calibra.evaluate_kmer_var()
+
+        if is_dir_mdn:
+            evaluator_before_calibra.evaluate_evidence_calibration()
+            print("After calibration:")
+            evaluator_after_calibra.evaluate_evidence_calibration()
 
         evaluator_before_calibra.evaluate_regional_score(valid_size)
         evaluator_after_calibra.evaluate_regional_score(valid_size)
@@ -523,6 +550,50 @@ class NBEvaluator(Evaluator):
 
             self.printer(f"\n--- {k}mer μ/r/var ---")
             self.printer(result)
+
+
+class DirMDNEvaluator(Evaluator):
+    """Evaluator subclass for Dirichlet MDN models.
+
+    Adds evidence-based reliability analysis:
+    - Bin validation samples by evidence percentile
+    - Report accuracy, confidence, and mean evidence per bin
+    """
+
+    def __init__(self, data_local, y_prob, n_class, evidence=None, calibra=None, use_obs_count=False, printer=print):
+        super().__init__(data_local, y_prob, n_class, calibra=calibra, use_obs_count=use_obs_count, printer=printer)
+        self.evidence = evidence
+
+    def evaluate_evidence_calibration(self, n_bins=10):
+        """Evaluate evidence-based reliability by percentile binning."""
+        if self.evidence is None:
+            self.printer("DirMDNEvaluator: no evidence data, skip evaluate_evidence_calibration.")
+            return
+
+        y_true = self.data_local['mut_type'].values
+        y_pred = self.y_prob.argmax(axis=1)
+        y_conf = self.y_prob.max(axis=1)
+
+        bins = np.percentile(self.evidence, np.linspace(0, 100, n_bins + 1))
+        bins[-1] += 1e-8
+
+        bin_indices = np.digitize(self.evidence, bins) - 1
+
+        results = []
+        for i in range(n_bins):
+            mask = bin_indices == i
+            if mask.sum() == 0:
+                continue
+            acc = (y_pred[mask] == y_true[mask]).mean()
+            conf = y_conf[mask].mean()
+            ev = self.evidence[mask].mean()
+            results.append((i, acc, conf, ev))
+
+        self.printer(f"\n--- Evidence Calibration ({n_bins} bins) ---")
+        self.printer(f"{'Bin':>5} {'Acc':>8} {'Conf':>8} {'Evidence':>10}")
+        for i, acc, conf, ev in results:
+            self.printer(f"{i:>5} {acc:>8.4f} {conf:>8.4f} {ev:>10.4f}")
+
 
 def save_model(model, fdiri_cal, config, save_path):
     """Save model state, fdiri_cal, config and validation predictions to the specified path."""
