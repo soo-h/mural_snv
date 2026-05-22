@@ -643,6 +643,43 @@ class EvidenceRecoder(Observer):
             self.recode(kwargs['valid_preds'])
 
 
+class PiEntropyRecoder(Observer):
+    """Collect pi_logits during validation and compute pi_entropy.
+
+    Used by Gamma MDN models. Activated by register_observer before valid_step.
+    Caller retrieves pi_entropy via output().
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pi_entropy = None
+
+    def reset(self):
+        self.pi_entropy = None
+
+    def recode(self, preds):
+        predict_out, _ = preds if isinstance(preds, tuple) else (preds, None)
+        if 'pi_logits' not in predict_out:
+            return
+        from MuRaL.models.gamma_mdn_model import compute_mdn_uncertainty
+        with torch.no_grad():
+            uncertainty = compute_mdn_uncertainty(predict_out)
+            entropy = uncertainty['pi_entropy'].cpu()
+        self.pi_entropy = (
+            entropy if self.pi_entropy is None
+            else torch.cat([self.pi_entropy, entropy], dim=0)
+        )
+
+    def output(self):
+        val = self.pi_entropy
+        self.reset()
+        return val
+
+    def update(self, **kwargs):
+        if 'valid_preds' in kwargs:
+            self.recode(kwargs['valid_preds'])
+
+
 class SubModelPredResRecoder(Observer):
     def __init__(self):
         # 使用字典统一管理模型结果，便于扩展

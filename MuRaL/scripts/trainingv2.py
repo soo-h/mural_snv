@@ -28,10 +28,10 @@ from MuRaL.evaluation.evaluation import *
 from MuRaL.data.preprocessing import *
 from MuRaL.data.dataset import dict_to_tuple_collate
 from MuRaL.models.custom_loss import *
-from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss
+from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
 from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, EvidenceRecoder
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, EvidenceRecoder, PiEntropyRecoder
 from MuRaL.utils.config_utils import read_bnn_config, read_feature_config
 
 sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
@@ -197,6 +197,13 @@ def train(config, args, checkpoint_dir=None):
                 f"DirichletMDN loss requires a DirMDN model variant "
                 f"(e.g. 151_dir_mdn), but got model_no={args.model_no}"
             )
+    is_gamma_mdn = isinstance(criterion, GammaMDNClassificationLoss)
+    if is_gamma_mdn:
+        if '_gamma_mdn' not in str(args.model_no):
+            raise ValueError(
+                f"GammaMDN loss requires a GammaMDN model variant "
+                f"(e.g. 151_gamma_mdn), but got model_no={args.model_no}"
+            )
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=args.mix_loss)
 
     config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto, config['weight_decay'])
@@ -232,6 +239,8 @@ def train(config, args, checkpoint_dir=None):
 
     evidence_recoder = EvidenceRecoder() if is_dir_mdn else None
 
+    pi_entropy_recoder = PiEntropyRecoder() if is_gamma_mdn else None
+
     if not args.use_ray:
         early_stopping = EarlyStopping(patience=args.grace_period, verbose=True)
 
@@ -249,6 +258,8 @@ def train(config, args, checkpoint_dir=None):
         else:
             if is_dir_mdn:
                 trainer.register_observer(evidence_recoder)
+            if is_gamma_mdn:
+                trainer.register_observer(pi_entropy_recoder)
             valid_pred_y = trainer.valid_step(dataloader_valid)
             valid_y_prob = to_np(F.softmax(valid_pred_y, dim=1))
         valid_y = data_local_valid['mut_type'].to_numpy().squeeze()
@@ -269,6 +280,14 @@ def train(config, args, checkpoint_dir=None):
                 valid_evidence = to_np(valid_evidence_t)
             trainer.remove_observer(evidence_recoder)
 
+        # Extract pi_entropy for GammaMDN models
+        valid_pi_entropy = None
+        if is_gamma_mdn:
+            valid_pi_entropy_t = pi_entropy_recoder.output()
+            if valid_pi_entropy_t is not None:
+                valid_pi_entropy = to_np(valid_pi_entropy_t)
+            trainer.remove_observer(pi_entropy_recoder)
+
         # calibrate
         if args.recurrent:
             weights = data_local_valid['sample_weight'].values.astype(int)
@@ -288,6 +307,9 @@ def train(config, args, checkpoint_dir=None):
         if is_nb:
             evaluator_before_calibra = NBEvaluator(data_local_valid, valid_y_prob, n_class, mu=valid_mu, r=valid_r, use_obs_count=args.recurrent, printer=print)
             evaluator_after_calibra = NBEvaluator(data_local_valid, prob_cal, n_class, mu=valid_mu, r=valid_r, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
+        elif is_gamma_mdn:
+            evaluator_before_calibra = GammaMDNEvaluator(data_local_valid, valid_y_prob, n_class, pi_entropy=valid_pi_entropy, use_obs_count=args.recurrent, printer=print)
+            evaluator_after_calibra = GammaMDNEvaluator(data_local_valid, prob_cal, n_class, pi_entropy=valid_pi_entropy, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
         elif is_dir_mdn:
             evaluator_before_calibra = DirMDNEvaluator(data_local_valid, valid_y_prob, n_class, evidence=valid_evidence, use_obs_count=args.recurrent, printer=print)
             evaluator_after_calibra = DirMDNEvaluator(data_local_valid, prob_cal, n_class, evidence=valid_evidence, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
@@ -301,6 +323,11 @@ def train(config, args, checkpoint_dir=None):
         if is_nb:
             evaluator_before_calibra.evaluate_kmer_var(kmer_list=[3])
             evaluator_after_calibra.evaluate_kmer_var()
+
+        if is_gamma_mdn:
+            evaluator_before_calibra.evaluate_entropy_calibration()
+            print("After calibration:")
+            evaluator_after_calibra.evaluate_entropy_calibration()
 
         if is_dir_mdn:
             evaluator_before_calibra.evaluate_evidence_calibration()
@@ -593,6 +620,100 @@ class DirMDNEvaluator(Evaluator):
         self.printer(f"{'Bin':>5} {'Acc':>8} {'Conf':>8} {'Evidence':>10}")
         for i, acc, conf, ev in results:
             self.printer(f"{i:>5} {acc:>8.4f} {conf:>8.4f} {ev:>10.4f}")
+
+
+class GammaMDNEvaluator(Evaluator):
+    """Evaluator subclass for Gamma MDN models.
+
+    For each mutation type c in {1,2,3} (skipping dominant class 0), computes
+    observed density vs predicted mean correlation across pi_entropy bins.
+    """
+
+    def __init__(self, data_local, y_prob, n_class, pi_entropy=None, calibra=None,
+                 use_obs_count=False, printer=print):
+        super().__init__(data_local, y_prob, n_class, calibra=calibra,
+                         use_obs_count=use_obs_count, printer=printer)
+        self.pi_entropy = pi_entropy
+
+    def evaluate_entropy_calibration(self, n_bins=10):
+        """Evaluate per-mutation-type obs-density vs pred-mean correlation across entropy bins."""
+        if self.pi_entropy is None:
+            self.printer("GammaMDNEvaluator: no pi_entropy data, skip evaluate_entropy_calibration.")
+            return None
+
+        pi_entropy_np = self.pi_entropy
+        if isinstance(pi_entropy_np, torch.Tensor):
+            pi_entropy_np = pi_entropy_np.numpy()
+
+        bin_edges = np.percentile(pi_entropy_np,
+            np.linspace(0, 100, n_bins + 1))
+
+        true_label = self.data_and_prob['mut_type'].values
+        n_probs = self.y_prob.shape[1]
+
+        records = []
+        for i in range(n_bins):
+            lo = bin_edges[i]
+            hi = bin_edges[i + 1]
+            if i == n_bins - 1:
+                mask = (pi_entropy_np >= lo) & (pi_entropy_np <= hi)
+            else:
+                mask = (pi_entropy_np >= lo) & (pi_entropy_np < hi)
+
+            n_samples = mask.sum()
+            if n_samples == 0:
+                continue
+
+            avg_entropy = pi_entropy_np[mask].mean()
+            label = (
+                f"ent<{hi:.3f}" if i == 0 else
+                f"ent>={lo:.3f}" if i == n_bins - 1 else
+                f"ent=[{lo:.3f},{hi:.3f})"
+            )
+
+            record = {
+                'bin': i,
+                'bin_label': label,
+                'n': n_samples,
+                'entropy': avg_entropy,
+            }
+
+            for c in range(1, n_probs):
+                obs_density = (true_label[mask] == c).mean()
+                pred_mean = self.y_prob[mask, c].mean()
+                record[f'prob{c}_obs_density'] = obs_density
+                record[f'prob{c}_pred_mean'] = pred_mean
+
+            records.append(record)
+
+        self._print_bin_results(records, n_probs)
+
+        correlations = {}
+        for c in range(1, n_probs):
+            obs_vals = [r[f'prob{c}_obs_density'] for r in records]
+            pred_vals = [r[f'prob{c}_pred_mean'] for r in records]
+            if len(obs_vals) >= 3:
+                corr = np.corrcoef(obs_vals, pred_vals)[0, 1]
+                correlations[f'prob{c}_corr'] = corr
+                self.printer(f"  prob{c} obs vs pred correlation: {corr:.4f}")
+            else:
+                correlations[f'prob{c}_corr'] = None
+
+        return correlations
+
+    def _print_bin_results(self, records, n_probs):
+        self.printer(f"\n--- Entropy Calibration ({len(records)} bins) ---")
+        for row in records:
+            parts = [
+                f"  bin{row['bin']+1} {row['bin_label']}: "
+                f"n={row['n']:>6d}  entropy={row['entropy']:.4f}"
+            ]
+            for c in range(1, n_probs):
+                parts.append(
+                    f"  prob{c}_obs={row[f'prob{c}_obs_density']:.6f}  "
+                    f"prob{c}_pred={row[f'prob{c}_pred_mean']:.6f}"
+                )
+            self.printer(''.join(parts))
 
 
 def save_model(model, fdiri_cal, config, save_path):

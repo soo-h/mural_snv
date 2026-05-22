@@ -137,6 +137,39 @@ def model_choice(model_no, config, emb_dims, distal_order, n_class, n_cont, in_c
                   distal_fc_dropout=config['distal_fc_dropout'], n_class=n_class, emb_padding_idx=4**config['local_order'],
                   config=model_config)
 
+    elif model_no == '151_gamma_mdn':
+        from MuRaL.models.gamma_mdn_model import Network3_ARG_condition_GammaMDN
+
+        model_config = {
+            'pooling_kind' : 'max',
+            'embeding_avg_mutations' : False,
+            'embeding_nuc_skew' : False,
+            'no_of_nuc_skew' : 14,
+            'use_local_fc2': True,
+            'use_local_fc3': True,
+            'local_model_name': 'AverageMutationModel_add2DCNN',
+            'local_fc2_name': 'hidden_with_relu',
+            'local_fc3_name': 'ConvModelDrop',
+        }
+
+        model_specify_config = {
+            'fused_type' : 'logit',
+            'n_arg_features' : 23,
+            'arg_hidden_dim' : 128,
+            'arg_out_dim' : 64,
+            'arg_dropout' : [0.2, 0.1, 0.1],
+            'K' : 3,
+        }
+
+        model_config.update(model_specify_config)
+
+        model = Network3_ARG_condition_GammaMDN(emb_dims, no_of_cont=config['no_of_cont'], lin_layer_sizes=[config['local_hidden1_size'], config['local_hidden2_size']],
+                  emb_dropout=config['emb_dropout'], lin_layer_dropouts=[config['local_dropout'], config['local_dropout']],
+                  in_channels=4, out_channels=config['CNN_out_channels'], kernel_size=config['CNN_kernel_size'],
+                  distal_radius=config['distal_radius'], distal_order=distal_order,
+                  distal_fc_dropout=config['distal_fc_dropout'], n_class=n_class, emb_padding_idx=4**config['local_order'],
+                  config=model_config, K=model_config.get('K', 3))
+
     else:
         print('Error: no model selected!')
         sys.exit() 

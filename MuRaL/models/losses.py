@@ -134,6 +134,71 @@ class DirichletMDNClassificationLoss(nn.Module):
         )
 
 
+class GammaMDNClassificationLoss(nn.Module):
+    """Gamma-MDN classification loss.
+
+    Model outputs raw pi_logits, alpha_raw, beta_raw; loss applies
+    activation internally (log_softmax for pi, softplus for alpha/beta).
+
+    Supports 2 pred formats:
+      - dict: {'pi_logits': (B,K), 'alpha_raw': (B,K,C), 'beta_raw': (B,K,C)}
+      - tuple: (pi_logits, alpha_raw, beta_raw)
+    """
+
+    def __init__(
+        self,
+        eps: float = 1e-8,
+        reduction: str = 'sum',
+    ):
+        super().__init__()
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, pred, y):
+        pi_logits, alpha_raw, beta_raw = self._unpack_pred(pred)
+        B, K, C = alpha_raw.shape
+
+        # --- Activation ---
+        log_pi = F.log_softmax(pi_logits, dim=1)           # (B, K)
+
+        alpha = F.softplus(alpha_raw) + self.eps            # (B, K, C), shape
+        beta = F.softplus(beta_raw) + self.eps              # (B, K, C), rate
+
+        # log p_k(c) via numerically stable log_softmax over log(alpha/beta)
+        log_lam = torch.log(alpha) - torch.log(beta)        # (B, K, C)
+        log_p_k = F.log_softmax(log_lam, dim=-1)            # (B, K, C)
+
+        # log p(y) via logsumexp
+        y_idx = y.view(B, 1, 1).expand(B, K, 1)             # (B, K, 1)
+        log_p_y = log_p_k.gather(dim=2, index=y_idx).squeeze(2)  # (B, K)
+
+        log_likelihood = torch.logsumexp(log_pi + log_p_y, dim=1)  # (B,)
+        nll_loss = -log_likelihood
+
+        # --- reduction ---
+        if self.reduction == 'mean':
+            nll_loss = nll_loss.mean()
+        elif self.reduction == 'sum':
+            nll_loss = nll_loss.sum()
+        elif self.reduction != 'none':
+            raise ValueError(f"Unknown reduction: {self.reduction}")
+
+        return nll_loss
+
+    @staticmethod
+    def _unpack_pred(pred):
+        if isinstance(pred, dict):
+            return pred['pi_logits'], pred['alpha_raw'], pred['beta_raw']
+        if isinstance(pred, (tuple, list)):
+            if len(pred) != 3:
+                raise ValueError("Tuple pred should be (pi_logits, alpha_raw, beta_raw).")
+            return pred[0], pred[1], pred[2]
+        raise TypeError(
+            "pred should be dict with keys ['pi_logits', 'alpha_raw', 'beta_raw'] "
+            "or tuple (pi_logits, alpha_raw, beta_raw)."
+        )
+
+
 class LossFactory():
     def __init__(self) -> None:
         pass
@@ -151,6 +216,8 @@ class LossFactory():
             return NegativeBinomialLoss(n_class=n_class, reduction='sum')
         elif loss_name == 'DirichletMDN':
             return DirichletMDNClassificationLoss(reduction='sum')
+        elif loss_name == 'GammaMDN':
+            return GammaMDNClassificationLoss(reduction='sum')
         else:
             raise ValueError(f"Unknown loss_name: {loss_name}")
 
@@ -299,6 +366,7 @@ class AdaptiveLossStrategy2():
 
         is_nb_loss = isinstance(criterion, NegativeBinomialLoss)
         is_dir_mdn = isinstance(criterion, DirichletMDNClassificationLoss)
+        is_gamma_mdn = isinstance(criterion, GammaMDNClassificationLoss)
         if is_nb_loss:
             mu = preds.get('mu')
             r = preds.get('r')
@@ -323,8 +391,8 @@ class AdaptiveLossStrategy2():
                 return (loss * sample_weight.squeeze()).sum()
             return loss
 
-        if is_dir_mdn:
-            # Dirichlet MDN loss：preds dict 直接传给 criterion
+        if is_dir_mdn or is_gamma_mdn:
+            # MDN loss: preds dict passed directly to criterion
             loss = criterion(preds, y)
             loss_local1 = loss_local2 = loss_local3 = None
             loss_mid = loss_distal = None
