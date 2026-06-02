@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_fusion_arg import Network3_ARG_condition
+from MuRaL.models.nn_models import Network3
 
 
 class DirichletMDNHead(nn.Module):
@@ -152,3 +153,53 @@ class Network3_ARG_condition_DirMDN(Network3_ARG_condition):
             predict_out['local_h2'] = local_outs['local_h2']
 
         return predict_out, None
+
+
+class Network3_DirMDN(Network3):
+    """Model3 variant with Dirichlet MDN head.
+
+    Uses submodel output logits concatenated as input to DirMDN head.
+    """
+
+    def __init__(self, *args, K=3, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # concat_dim = submodel_count * n_class (4->16 or 3->12)
+        submodel_count = 4 if self.no_of_cont > 0 else 3
+        proj_in_dim = submodel_count * self.n_class
+
+        self.dir_mdn_proj = nn.Sequential(
+            nn.Linear(proj_in_dim, 64),
+            nn.ReLU(),
+        )
+        self.mdn_head = DirichletMDNHead(
+            in_dim=64, K=K, C=self.n_class, hidden_dim=64,
+        )
+        self.K = K
+
+    def forward(self, local_input, distal_input):
+        # Step 1: Reuse base forward
+        base_out, _ = super().forward(local_input, distal_input)
+
+        # Step 2: Concat submodel logits (fixed order)
+        logit_list = [
+            base_out['local'],
+            base_out['mid'],
+            base_out['distal'],
+        ]
+        if base_out.get('local2') is not None:
+            logit_list.append(base_out['local2'])
+
+        concat = torch.cat(logit_list, dim=1)    # [B, 12~16]
+        hidden = self.dir_mdn_proj(concat)       # [B, 64]
+
+        pi_logits, alpha_raw = self.mdn_head(hidden)
+
+        # Step 3: Build output dict
+        base_out['pi_logits'] = pi_logits         # [B, K], raw
+        base_out['alpha_raw'] = alpha_raw         # [B, K, C], raw
+
+        inferred = dirichlet_mdn_predict_from_output(base_out)
+        base_out['out'] = inferred['logits']
+
+        return base_out, None

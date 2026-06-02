@@ -606,19 +606,26 @@ class MuRRecoder(Observer):
             self.recode(kwargs['valid_preds'])
 
 
-class EvidenceRecoder(Observer):
-    """Collect pi_logits/alpha_raw during validation and compute evidence.
+class DirMDNRecoder(Observer):
+    """Collect evidence and unactivated components (pi_logits, alpha_raw)
+    during DirMDN validation/prediction.
 
-    Used by Dirichlet MDN models. Activated via Trainer(collect_evidence=True).
-    Caller retrieves evidence via Trainer.get_evidence().
+    - output() returns evidence
+    - get_components() returns (pi_logits, alpha_raw)
+    - reset() clears all buffers (caller's responsibility)
+    - output() and get_components() do NOT reset -- callable in any order
     """
 
     def __init__(self):
         super().__init__()
         self.evidence = None
+        self.pi_logits = None
+        self.alpha_raw = None
 
     def reset(self):
         self.evidence = None
+        self.pi_logits = None
+        self.alpha_raw = None
 
     def recode(self, preds):
         predict_out, _ = preds if isinstance(preds, tuple) else (preds, None)
@@ -632,30 +639,50 @@ class EvidenceRecoder(Observer):
             ev if self.evidence is None
             else torch.cat([self.evidence, ev], dim=0)
         )
+        pi = predict_out['pi_logits'].detach().cpu()
+        alpha = predict_out['alpha_raw'].detach().cpu()
+        self.pi_logits = (
+            pi if self.pi_logits is None
+            else torch.cat([self.pi_logits, pi], dim=0)
+        )
+        self.alpha_raw = (
+            alpha if self.alpha_raw is None
+            else torch.cat([self.alpha_raw, alpha], dim=0)
+        )
 
     def output(self):
-        ev = self.evidence
-        self.reset()
-        return ev
+        return self.evidence
+
+    def get_components(self):
+        return self.pi_logits, self.alpha_raw
 
     def update(self, **kwargs):
         if 'valid_preds' in kwargs:
             self.recode(kwargs['valid_preds'])
 
 
-class PiEntropyRecoder(Observer):
-    """Collect pi_logits during validation and compute pi_entropy.
+class GammaMDNRecoder(Observer):
+    """Collect pi_entropy and unactivated components (pi_logits, alpha_raw, beta_raw)
+    during Gamma MDN validation/prediction.
 
-    Used by Gamma MDN models. Activated by register_observer before valid_step.
-    Caller retrieves pi_entropy via output().
+    - output() returns pi_entropy
+    - get_components() returns (pi_logits, alpha_raw, beta_raw)
+    - reset() clears all buffers (caller's responsibility)
+    - output() and get_components() do NOT reset -- callable in any order
     """
 
     def __init__(self):
         super().__init__()
         self.pi_entropy = None
+        self.pi_logits = None
+        self.alpha_raw = None
+        self.beta_raw = None
 
     def reset(self):
         self.pi_entropy = None
+        self.pi_logits = None
+        self.alpha_raw = None
+        self.beta_raw = None
 
     def recode(self, preds):
         predict_out, _ = preds if isinstance(preds, tuple) else (preds, None)
@@ -669,11 +696,27 @@ class PiEntropyRecoder(Observer):
             entropy if self.pi_entropy is None
             else torch.cat([self.pi_entropy, entropy], dim=0)
         )
+        pi = predict_out['pi_logits'].detach().cpu()
+        alpha = predict_out['alpha_raw'].detach().cpu()
+        beta = predict_out['beta_raw'].detach().cpu()
+        self.pi_logits = (
+            pi if self.pi_logits is None
+            else torch.cat([self.pi_logits, pi], dim=0)
+        )
+        self.alpha_raw = (
+            alpha if self.alpha_raw is None
+            else torch.cat([self.alpha_raw, alpha], dim=0)
+        )
+        self.beta_raw = (
+            beta if self.beta_raw is None
+            else torch.cat([self.beta_raw, beta], dim=0)
+        )
 
     def output(self):
-        val = self.pi_entropy
-        self.reset()
-        return val
+        return self.pi_entropy
+
+    def get_components(self):
+        return self.pi_logits, self.alpha_raw, self.beta_raw
 
     def update(self, **kwargs):
         if 'valid_preds' in kwargs:

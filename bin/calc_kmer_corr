@@ -16,8 +16,9 @@ from scipy.stats import pearsonr
 import numpy as np
 
 from MuRaL.data.preprocessing import get_expanded_region
-from MuRaL.utils.info_utils import parse_pred_header, read_pred_line
+from MuRaL.utils.info_utils import parse_pred_header, PredLineReader
 from MuRaL.evaluation.obs_pred_aggregator import KmerMutSaver
+from MuRaL.evaluation.uncertainty import load_uncertainty, build_uncertainty_df
 from typing import Dict, Any
 
 
@@ -51,6 +52,10 @@ def parse_arguments():
                             'values instead of prob columns. Only valid for '
                             'NB model prediction files. When the file has no '
                             'mu columns, silently falls back to prob.')
+    parser.add_argument('--uncertainty', default=None, type=str,
+                       help='Uncertainty metrics file (*_uncertainty.tsv.gz). '
+                            'When provided, mean uncertainty per k-mer is '
+                            'appended to the output table.')
 
     args = parser.parse_args()
 
@@ -84,15 +89,16 @@ def load_chromosome_sequence(genome_file: Path, chrom: str) -> str:
 # ----------------------
 # K-mer Processing
 # ----------------------
-def process_kmer_seq(strand: str, sequence: str, mut_type: int, probs: list, count: int, data_saver) -> None:
+def process_kmer_seq(strand: str, sequence: str, mut_type: int, probs: list,
+                     count: int, data_saver, is_new_site: bool = True) -> None:
     """Process mutation site statistics for a single k-mer"""
     if not is_valid_sequence(sequence):
         return
     # get kmer sequence
     canonical_kmer = get_canonical_kmer(strand, sequence)
     # Update k-mer counts
-    data_saver.add_obs(canonical_kmer, mut_type, count)
-    data_saver.add_pred(canonical_kmer, probs)
+    data_saver.add_obs(canonical_kmer, mut_type, count, is_new_site)
+    data_saver.add_pred(canonical_kmer, probs, is_new_site)
 
 
 def is_valid_sequence(sequence: str) -> bool:
@@ -199,6 +205,16 @@ def run_kmer_corr_calc(args, model_type:'str') -> None:
               "bases on both sides.", file=sys.stderr)
         sys.exit(1)
 
+    # Load uncertainty file if provided
+    unc_lookup = None
+    metric_cols = None
+    unc_sum = None
+    if args.uncertainty:
+        unc_lookup, metric_cols = load_uncertainty(args.uncertainty)
+        print(f"Loaded {len(unc_lookup)} sites with {len(metric_cols)} "
+              f"uncertainty metrics: {metric_cols}", file=sys.stderr)
+        unc_sum = {}
+
     # Open prediction file
     opener = gzip.open if args.pred_file.endswith('.gz') else open
     # save kmer count of obs and predict
@@ -226,16 +242,19 @@ def run_kmer_corr_calc(args, model_type:'str') -> None:
                 print('Using mu columns as predicted values for correlation '
                       'calculation.', file=sys.stderr)
 
+        line_reader = PredLineReader(header_info, recurrent=args.recurrent,
+                                      use_mu=args.use_mu)
+
         for line in obs_file:
             line = line.strip().split('\t')
-            parsed = read_pred_line(line, header_info, recurrent=args.recurrent,
-                                    use_mu=args.use_mu)
+            parsed = line_reader.read(line)
             chrom = parsed['chrom']
             start, end = parsed['start'], parsed['end']
             strand = parsed['strand']
             mut = parsed['mut_type']
             probs = parsed['probs']
             count = parsed['count']
+            is_new = parsed['is_new_site']
 
             if model_type == 'indel':
                 strand = args.strand
@@ -261,7 +280,8 @@ def run_kmer_corr_calc(args, model_type:'str') -> None:
                     mut_type=mut,
                     probs=probs,
                     count=count,
-                    data_saver=kmer_mut_saver
+                    data_saver=kmer_mut_saver,
+                    is_new_site=is_new,
                 )
                 process_kmer_seq(
                     strand='-',
@@ -269,7 +289,8 @@ def run_kmer_corr_calc(args, model_type:'str') -> None:
                     mut_type=mut,
                     probs=probs,
                     count=count,
-                    data_saver=kmer_mut_saver
+                    data_saver=kmer_mut_saver,
+                    is_new_site=is_new,
                 )
             else:
                 process_kmer_seq(
@@ -278,11 +299,43 @@ def run_kmer_corr_calc(args, model_type:'str') -> None:
                     mut_type=mut,
                     probs=probs,
                     count=count,
-                    data_saver=kmer_mut_saver
+                    data_saver=kmer_mut_saver,
+                    is_new_site=is_new,
                 )
+
+            # Accumulate uncertainty per k-mer
+            if unc_lookup is not None:
+                unc_values = unc_lookup.get((chrom, start, end))
+                if unc_values is None:
+                    print(f"Error: site ({chrom}, {start}, {end}) "
+                          f"not found in uncertainty file", file=sys.stderr)
+                    sys.exit(1)
+                if strand == 'both':
+                    for s in ('+', '-'):
+                        canonical = get_canonical_kmer(s, kmer_seq)
+                        if canonical not in unc_sum:
+                            unc_sum[canonical] = np.zeros(
+                                len(metric_cols), dtype=np.float64)
+                        unc_sum[canonical] += unc_values
+                else:
+                    canonical = get_canonical_kmer(strand, kmer_seq)
+                    if canonical not in unc_sum:
+                        unc_sum[canonical] = np.zeros(
+                            len(metric_cols), dtype=np.float64)
+                    unc_sum[canonical] += unc_values
 
     # Calculate and save results
     results_df = calculate_mutation_rates(kmer_mut_saver)
+
+    # Append mean uncertainty columns
+    if unc_sum is not None:
+        unc_df = build_uncertainty_df(unc_sum,
+                                      kmer_mut_saver.site_count,
+                                      metric_cols)
+        results_df = results_df.set_index('type')
+        unc_df = unc_df.loc[results_df.index]
+        results_df = pd.concat([results_df, unc_df], axis=1).reset_index()
+
     corr_results = calculate_correlations(results_df, n_class)
     write_output_files(args, results_df, corr_results)
 

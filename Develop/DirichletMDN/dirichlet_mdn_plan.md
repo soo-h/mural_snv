@@ -417,9 +417,33 @@ def dirichlet_mdn_predict_from_output(out, eps=1e-8):
 
 按 evidence 分 bin 评估 calibration 质量。低 evidence 的样本预期校准更差。
 
+由于 mutation rate 数据存在严重的类别不平衡（背景占绝大多数），使用 acc/conf 不能反映真实校准质量。更合理的评估方式是比较每个 bin 中的**预测类别概率均值**与**观测类别密度**，并按突变类型（prob1-prob3）分别给出跨 bin 相关性。
+
+### 指标定义
+
+- **观测类别密度**：每个 bin 中各类别（c ∈ {1, 2, 3}）样本的比例
+  - `obs_density_c = sum(y == c) / n`
+- **预测类别概率均值**：每个 bin 中 `prob[:, c]` 的均值
+  - `pred_rate_c = mean(prob[:, c])`
+- **跨 bin 相关性**：对每个类别 c，计算 `pearsonr(obs_density_c, pred_rate_c)`，衡量 evidence 分箱能否反映校准趋势
+
+### 输出格式
+
+```
+--- Evidence Calibration (5 bins) ---
+  bin1 ev<0.50:    n= 2000  obs_1=0.0012 pred_1=0.0010  obs_2=0.0031 pred_2=0.0029  obs_3=0.0080 pred_3=0.0076  evidence=0.35
+  bin2 ev=[0.50,1.20): n= 2000  ...
+  ...
+  >> evidence calibration correlation:  prob1 r=0.98 (p=1.2e-03)  prob2 r=0.95 (p=5.3e-03)  prob3 r=0.97 (p=2.1e-03)
+```
+
 ```python
 class DirMDNEvaluator(Evaluator):
-    """Evaluator 子类，按 evidence 分 bin 评估 calibration。"""
+    """Evaluator 子类，按 evidence 分 bin 评估 calibration。
+
+    对每个突变类型（prob1-prob3）分别比较预测概率均值与观测密度，
+    计算跨 bin 相关性，避免类别不平衡对 acc/conf 的扭曲。
+    """
 
     def __init__(self, data_local, y_prob, n_class, evidence=None, n_bins=5,
                  calibra=None, use_obs_count=False, printer=print):
@@ -427,9 +451,11 @@ class DirMDNEvaluator(Evaluator):
                          use_obs_count=use_obs_count, printer=printer)
         self.evidence = evidence
         self.n_bins = n_bins
+        # 突变类型列：假设 prob0=背景, prob1-prob3=突变类型
+        self.mut_classes = list(range(1, n_class))  # [1, 2, 3]
 
     def evaluate_evidence_calibration(self):
-        """按 evidence 分 bin，报告每桶的准确率、置信度、证据均值。"""
+        """按 evidence 分 bin，输出每桶各类别的 obs/pred，并计算跨 bin 相关性。"""
         if self.evidence is None:
             return
 
@@ -437,17 +463,14 @@ class DirMDNEvaluator(Evaluator):
             np.linspace(0, 100, self.n_bins + 1))
 
         true_label = self.data_and_prob['mut_type'].values
-        pred_class = self.y_prob.argmax(axis=1)
-        max_prob = self.y_prob.max(axis=1)
+
+        # 对每个 bin 收集各类别的 (obs_density, pred_rate)
+        all_bin_stats = []  # 每个元素: {c: (obs, pred), 'evidence': ..., 'n': ...}
 
         for i in range(self.n_bins):
             lo = bin_edges[i]
             hi = bin_edges[i + 1]
-            mask = (self.evidence >= lo) & (self.evidence <= hi)
-            if i == 0:
-                # 第一桶包含下界相等值
-                pass
-            elif i == self.n_bins - 1:
+            if i == self.n_bins - 1:
                 mask = (self.evidence >= lo) & (self.evidence <= hi)
             else:
                 mask = (self.evidence >= lo) & (self.evidence < hi)
@@ -455,10 +478,18 @@ class DirMDNEvaluator(Evaluator):
             if mask.sum() == 0:
                 continue
 
-            acc = (pred_class[mask] == true_label[mask]).mean()
-            avg_conf = max_prob[mask].mean()
-            avg_ev = self.evidence[mask].mean()
+            bin_stats = {'n': mask.sum(), 'evidence': self.evidence[mask].mean()}
+            for c in self.mut_classes:
+                obs_density = (true_label[mask] == c).mean()
+                pred_rate = self.y_prob[mask, c].mean()
+                bin_stats[c] = (obs_density, pred_rate)
+            all_bin_stats.append(bin_stats)
 
+            # 格式化输出（一行 6 列 obs/pred）
+            parts = []
+            for c in self.mut_classes:
+                obs, pred = bin_stats[c]
+                parts.append(f"obs_{c}={obs:.6f} pred_{c}={pred:.6f}")
             label = (
                 f"ev<{hi:.2f}" if i == 0 else
                 f"ev>={lo:.2f}" if i == self.n_bins - 1 else
@@ -466,10 +497,21 @@ class DirMDNEvaluator(Evaluator):
             )
             self.printer(
                 f"  bin{i+1} {label}: "
-                f"n={mask.sum():>6d}  "
-                f"acc={acc:.4f}  "
-                f"conf={avg_conf:.4f}  "
-                f"evidence={avg_ev:.2f}"
+                f"n={bin_stats['n']:>6d}  "
+                + "  ".join(parts) +
+                f"  evidence={bin_stats['evidence']:.2f}"
+            )
+
+        # 对每个类别计算跨 bin 相关性
+        if len(all_bin_stats) >= 3:
+            corr_strs = []
+            for c in self.mut_classes:
+                obs_arr = np.array([s[c][0] for s in all_bin_stats])
+                pred_arr = np.array([s[c][1] for s in all_bin_stats])
+                corr, p_val = pearsonr(obs_arr, pred_arr)
+                corr_strs.append(f"prob{c} r={corr:.4f} (p={p_val:.4e})")
+            self.printer(
+                "  >> evidence calibration correlation:  " + "  ".join(corr_strs)
             )
 ```
 
@@ -599,3 +641,43 @@ elif model_no == '151_dir_mdn':
 9. **模型别名**：`151_dir_mdn`（标准），`151_dir_mdn_aux`（aux 变体，后续实现）。
 
 10. **不对预训练权重做加载兼容**：`DirMDN` 的 state_dict 与原始 151 不兼容。
+
+---
+
+## TODO: 下次迭代
+
+### A. 裁剪 `dirichlet_mdn_predict_from_output` 返回字段
+
+当前返回的 `pi`, `alpha`, `p_k`, `pred_class`, `uncertainty` 均未被下游使用，裁剪为仅保留 `prob`, `logits`, `evidence`。
+
+**涉及文件**：`MuRaL/models/dirichlet_mdn_model.py`
+
+### B. 新增轻量 uncertainty 计算函数
+
+在 `dirichlet_mdn_model.py` 中新增：
+
+```python
+def compute_dirichlet_uncertainty(predict_out, method="evidence", eps=1e-8):
+    """从 Dirichlet MDN 输出计算不确定性指标。
+
+    当前支持:
+      - "evidence": 总证据强度 E = Σₖ πₖ · Σ𝒸 α_{k,c}
+      后续可扩展: "epistemic", "entropy", "mutual_info" 等
+    """
+```
+
+**涉及文件**：`MuRaL/models/dirichlet_mdn_model.py`
+
+### C. `EvidenceRecoder` 改用 `compute_dirichlet_uncertainty`
+
+将 `recode()` 内的调用从 `dirichlet_mdn_predict_from_output` 替换为 `compute_dirichlet_uncertainty`，避免完整激活的重复计算。
+
+**涉及文件**：`MuRaL/evaluation/observer.py`
+
+### D. `DirMDNEvaluator` 评估改为 per-class obs/pred 相关性
+
+当前使用 acc/conf 逐 bin 输出，不适应类别不平衡。改为：
+- 每 bin 输出 6 列：`obs_1/pred_1` `obs_2/pred_2` `obs_3/pred_3`
+- 每类分别计算跨 bin `pearsonr`，输出 3 个相关系数
+
+**涉及文件**：`MuRaL/scripts/trainingv2.py`

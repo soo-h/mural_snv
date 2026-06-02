@@ -112,3 +112,37 @@ def read_pred_line(fields, header_info, recurrent=False, use_mu=False):
 
     return result
 
+
+class PredLineReader:
+    """Stateful line parser with multi-allelic site detection.
+
+    Wraps read_pred_line and tracks consecutive (chrom, start, end)
+    coordinates. When the same genomic position appears on adjacent
+    lines, marks subsequent occurrences with is_new_site=False so
+    downstream aggregators skip duplicate prediction accumulation.
+    """
+
+    def __init__(self, header_info, recurrent=False, use_mu=False):
+        self._header_info = header_info
+        self._recurrent = recurrent
+        self._use_mu = use_mu
+        self._last_coord = None
+
+    def read(self, fields):
+        """Parse a line and detect multi-allelic duplicates.
+
+        Returns:
+            dict: same as read_pred_line, plus 'is_new_site' (bool)
+        """
+        result = read_pred_line(fields, self._header_info,
+                                recurrent=self._recurrent,
+                                use_mu=self._use_mu)
+        coord = (result['chrom'], result['start'], result['end'])
+        result['is_new_site'] = (coord != self._last_coord)
+        self._last_coord = coord
+        return result
+
+    def reset(self):
+        """Reset coordinate buffer (call before processing a new file)."""
+        self._last_coord = None
+

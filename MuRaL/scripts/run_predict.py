@@ -384,12 +384,35 @@ def main():
 
     # Loss function
     is_nb_model = '_nb' in str(config.get('model_no', ''))
+    is_dir_mdn_model = '_dir_mdn' in str(config.get('model_no', ''))
+    is_gamma_mdn_model = '_gamma_mdn' in str(config.get('model_no', ''))
     if is_nb_model:
         criterion = NegativeBinomialLoss(n_class=n_class, reduction='sum')
         criterion.to(device)
         print("Using NegativeBinomialLoss for NB model:", config.get('model_no'))
+    elif is_dir_mdn_model:
+        from MuRaL.models.losses import DirichletMDNClassificationLoss
+        criterion = DirichletMDNClassificationLoss(reduction='sum')
+        print("Using DirichletMDNClassificationLoss for DirMDN model:", config.get('model_no'))
+    elif is_gamma_mdn_model:
+        from MuRaL.models.losses import GammaMDNClassificationLoss
+        criterion = GammaMDNClassificationLoss(reduction='sum')
+        print("Using GammaMDNClassificationLoss for GammaMDN model:", config.get('model_no'))
     else:
         criterion = torch.nn.CrossEntropyLoss(reduction='sum')
+
+    # Validation
+    if is_gamma_mdn_model:
+        if '_gamma_mdn' not in str(config.get('model_no', '')):
+            raise ValueError(
+                f"GammaMDN loss requires a GammaMDN model variant "
+                f"(e.g. 151_gamma_mdn), but got model_no={config.get('model_no')}"
+            )
+        if calc_loss_strategy_name != 'SKA_local':
+            raise ValueError(
+                f"GammaMDN model requires 'SKA_local' strategy to provide arg_feature, "
+                f"but got {calc_loss_strategy_name}"
+            )
 
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=mix_loss)
 
@@ -413,7 +436,9 @@ def main():
         model.to(device)
         predictor = Predictor(model, loss_calculator, criterion, device, config,
                       observer=Observer, printer=print, train_strategy=calc_loss_strategy_name,
-                      collect_mu_r=is_nb_model)
+                      collect_mu_r=is_nb_model,
+                      collect_evidence=is_dir_mdn_model,
+                      collect_gamma_mdn=is_gamma_mdn_model)
 
     print('model:')
     print(model)
@@ -483,6 +508,32 @@ def main():
                 else:
                     print('Warning: NB model did not output mu/r. Skipping mu/r collection.')
 
+            # collect evidence for DirMDN models
+            if is_dir_mdn_model:
+                valid_evidence = predictor.get_evidence()
+                if valid_evidence is not None:
+                    evidence_df = pd.DataFrame(
+                        data=to_np(valid_evidence),
+                        columns=['evidence']
+                    )
+                    dfs.append(evidence_df)
+                    print('evidence stats:', to_np(valid_evidence).mean())
+                else:
+                    print('Warning: DirMDN model did not output evidence. Skipping evidence collection.')
+
+            # collect pi_entropy for Gamma MDN models
+            if is_gamma_mdn_model:
+                valid_pi_entropy = predictor.get_pi_entropy()
+                if valid_pi_entropy is not None:
+                    pi_entropy_df = pd.DataFrame(
+                        data=to_np(valid_pi_entropy),
+                        columns=['pi_entropy']
+                    )
+                    dfs.append(pi_entropy_df)
+                    print('pi_entropy stats:', to_np(valid_pi_entropy).mean())
+                else:
+                    print('Warning: Gamma MDN model did not output pi_entropy. Skipping pi_entropy collection.')
+
             # Print some data for debugging
             for i in range(1, n_class):
                 print('min and max of pred_y: type', i, np.min(to_np(F.softmax(pred_y, dim=1))[:,i]), np.max(to_np(F.softmax(pred_y, dim=1))[:,i]))
@@ -516,7 +567,50 @@ def main():
     pred_df.reset_index(drop=True, inplace=True)
     # 输出文件包含info列
     pred_df.to_csv(pred_file, sep='\t', float_format='%.4g', index=False)
-    
+
+    # Save DirMDN unactivated components (pi_logits + alpha_raw) to separate file
+    if is_dir_mdn_model:
+        valid_pi_logits, valid_alpha_raw = predictor.get_dir_mdn_components()
+        if valid_pi_logits is not None:
+            pi_cols = [f'pi_logits_k{i}' for i in range(valid_pi_logits.shape[1])]
+            K, C = valid_alpha_raw.shape[1], valid_alpha_raw.shape[2]
+            alpha_cols = [f'alpha_raw_k{k}_c{c}' for k in range(K) for c in range(C)]
+            pi_df = pd.DataFrame(data=to_np(valid_pi_logits), columns=pi_cols)
+            alpha_df = pd.DataFrame(
+                data=to_np(valid_alpha_raw.reshape(valid_alpha_raw.shape[0], -1)),
+                columns=alpha_cols
+            )
+            raw_df = pd.concat([chr_pos, pi_df, alpha_df], axis=1)
+            pred_file_raw = pred_file.split('.bed.tsv.gz')[0] + '_dir_mdn_unactivated.tsv.gz'
+            raw_df.to_csv(pred_file_raw, sep='\t', float_format='%.4g', index=False)
+            print('DirMDN unactivated components saved to:', pred_file_raw)
+        else:
+            print('Warning: DirMDN model did not output pi_logits/alpha_raw.')
+
+    # Save Gamma MDN unactivated components (pi_logits + alpha_raw + beta_raw) to separate file
+    if is_gamma_mdn_model:
+        valid_pi_logits, valid_alpha_raw, valid_beta_raw = predictor.get_gamma_mdn_components()
+        if valid_pi_logits is not None:
+            pi_cols = [f'pi_logits_k{i}' for i in range(valid_pi_logits.shape[1])]
+            K, C = valid_alpha_raw.shape[1], valid_alpha_raw.shape[2]
+            alpha_cols = [f'alpha_raw_k{k}_c{c}' for k in range(K) for c in range(C)]
+            beta_cols = [f'beta_raw_k{k}_c{c}' for k in range(K) for c in range(C)]
+            pi_df = pd.DataFrame(data=to_np(valid_pi_logits), columns=pi_cols)
+            alpha_df = pd.DataFrame(
+                data=to_np(valid_alpha_raw.reshape(valid_alpha_raw.shape[0], -1)),
+                columns=alpha_cols
+            )
+            beta_df = pd.DataFrame(
+                data=to_np(valid_beta_raw.reshape(valid_beta_raw.shape[0], -1)),
+                columns=beta_cols
+            )
+            raw_df = pd.concat([chr_pos, pi_df, alpha_df, beta_df], axis=1)
+            pred_file_raw = pred_file.split('.bed.tsv.gz')[0] + '_gamma_mdn_unactivated.tsv.gz'
+            raw_df.to_csv(pred_file_raw, sep='\t', float_format='%.4g', index=False)
+            print('Gamma MDN unactivated components saved to:', pred_file_raw)
+        else:
+            print('Warning: Gamma MDN model did not output pi_logits/alpha_raw/beta_raw.')
+
     #do k-mer evaluation
     if len(kmer_corr) > 0:
         modes = [i%2 for i in kmer_corr]

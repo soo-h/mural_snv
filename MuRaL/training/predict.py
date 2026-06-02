@@ -2,14 +2,14 @@ import torch
 import time
 
 import torch.nn.functional as F
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2, DirMDNRecoder, GammaMDNRecoder
 from MuRaL.training.train import TrainerSubject, get_inputs_labels, model_train_register
 
 
 
 
 class Predictor(TrainerSubject):
-    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False, collect_mu_r=False) -> None:
+    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False) -> None:
 
         super().__init__()
 
@@ -22,6 +22,8 @@ class Predictor(TrainerSubject):
         self.train_strategy = train_strategy
         self.detach = detach
         self.collect_mu_r = collect_mu_r
+        self.collect_evidence = collect_evidence
+        self.collect_gamma_mdn = collect_gamma_mdn
 
         if observer is None:
             self.observer = [TimeMinor(out_after_n_batch=1000),LossMinor()]
@@ -38,12 +40,20 @@ class Predictor(TrainerSubject):
         self.metrics = {}
         if collect_mu_r:
             self._mu_r_recoder = MuRRecoder()
+        if collect_evidence:
+            self._dir_mdn_recoder = DirMDNRecoder()
+        if collect_gamma_mdn:
+            self._gamma_mdn_recoder = GammaMDNRecoder()
 
     def predict(self, dataloader_test):
         self.register_observer(self.valid_preds_recoder)
         self.register_observer(self.contribution_minor)
         if self.collect_mu_r:
             self.register_observer(self._mu_r_recoder)
+        if self.collect_evidence:
+            self.register_observer(self._dir_mdn_recoder)
+        if self.collect_gamma_mdn:
+            self.register_observer(self._gamma_mdn_recoder)
         self.model.eval()
         valid_step_time = time.time()
         with torch.no_grad():
@@ -70,6 +80,10 @@ class Predictor(TrainerSubject):
         self.remove_observer(self.contribution_minor)
         if self.collect_mu_r:
             self.remove_observer(self._mu_r_recoder)
+        if self.collect_evidence:
+            self.remove_observer(self._dir_mdn_recoder)
+        if self.collect_gamma_mdn:
+            self.remove_observer(self._gamma_mdn_recoder)
         return valid_preds
     
     def predict_each_model(self, dataloader_test):
@@ -120,6 +134,47 @@ class Predictor(TrainerSubject):
         if hasattr(self, '_mu_r_recoder'):
             return self._mu_r_recoder.output()
         return None, None
+
+    def get_evidence(self):
+        """返回收集的 evidence 向量。
+
+        仅当 collect_evidence=True 且模型为 DirMDN variant 时返回有效值。
+        """
+        if hasattr(self, '_dir_mdn_recoder'):
+            return self._dir_mdn_recoder.output()
+        return None
+
+    def get_dir_mdn_components(self):
+        """返回未激活的 DirMDN 分量 (pi_logits, alpha_raw)。
+
+        - pi_logits: [B, K], raw (需 softmax 激活)
+        - alpha_raw: [B, K, C], raw (需 softplus 激活)
+        仅当 collect_evidence=True 且模型为 DirMDN variant 时返回有效值。
+        """
+        if hasattr(self, '_dir_mdn_recoder'):
+            return self._dir_mdn_recoder.get_components()
+        return None, None
+
+    def get_pi_entropy(self):
+        """返回收集的 pi_entropy 向量。
+
+        仅当 collect_gamma_mdn=True 且模型为 Gamma MDN variant 时返回有效值。
+        """
+        if hasattr(self, '_gamma_mdn_recoder'):
+            return self._gamma_mdn_recoder.output()
+        return None
+
+    def get_gamma_mdn_components(self):
+        """返回未激活的 Gamma MDN 分量 (pi_logits, alpha_raw, beta_raw)。
+
+        - pi_logits: [B, K], raw (需 softmax 激活)
+        - alpha_raw:  [B, K, C], raw (需 softplus 激活)
+        - beta_raw:   [B, K, C], raw (需 softplus 激活)
+        仅当 collect_gamma_mdn=True 且模型为 Gamma MDN variant 时返回有效值。
+        """
+        if hasattr(self, '_gamma_mdn_recoder'):
+            return self._gamma_mdn_recoder.get_components()
+        return None, None, None
 
 def model_predict(batch, model, detach, strategy):
     if detach:

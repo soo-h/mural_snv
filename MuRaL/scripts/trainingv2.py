@@ -31,7 +31,7 @@ from MuRaL.models.custom_loss import *
 from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
 from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, EvidenceRecoder, PiEntropyRecoder
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, DirMDNRecoder, GammaMDNRecoder
 from MuRaL.utils.config_utils import read_bnn_config, read_feature_config
 
 sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
@@ -237,9 +237,9 @@ def train(config, args, checkpoint_dir=None):
                           observer=Observer, printer=print, train_strategy=calc_loss_strategy_name,
                           collect_mu_r=is_nb)
 
-    evidence_recoder = EvidenceRecoder() if is_dir_mdn else None
+    dir_mdn_recoder = DirMDNRecoder() if is_dir_mdn else None
 
-    pi_entropy_recoder = PiEntropyRecoder() if is_gamma_mdn else None
+    pi_entropy_recoder = GammaMDNRecoder() if is_gamma_mdn else None
 
     if not args.use_ray:
         early_stopping = EarlyStopping(patience=args.grace_period, verbose=True)
@@ -257,7 +257,7 @@ def train(config, args, checkpoint_dir=None):
         
         else:
             if is_dir_mdn:
-                trainer.register_observer(evidence_recoder)
+                trainer.register_observer(dir_mdn_recoder)
             if is_gamma_mdn:
                 trainer.register_observer(pi_entropy_recoder)
             valid_pred_y = trainer.valid_step(dataloader_valid)
@@ -275,10 +275,11 @@ def train(config, args, checkpoint_dir=None):
         # Extract evidence for DirMDN models
         valid_evidence = None
         if is_dir_mdn:
-            valid_evidence_t = evidence_recoder.output()
+            valid_evidence_t = dir_mdn_recoder.output()
             if valid_evidence_t is not None:
                 valid_evidence = to_np(valid_evidence_t)
-            trainer.remove_observer(evidence_recoder)
+            dir_mdn_recoder.reset()
+            trainer.remove_observer(dir_mdn_recoder)
 
         # Extract pi_entropy for GammaMDN models
         valid_pi_entropy = None
@@ -286,6 +287,7 @@ def train(config, args, checkpoint_dir=None):
             valid_pi_entropy_t = pi_entropy_recoder.output()
             if valid_pi_entropy_t is not None:
                 valid_pi_entropy = to_np(valid_pi_entropy_t)
+            pi_entropy_recoder.reset()
             trainer.remove_observer(pi_entropy_recoder)
 
         # calibrate
