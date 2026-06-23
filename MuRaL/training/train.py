@@ -470,29 +470,76 @@ class TorchBackendManager:
         self.printer("torch.cuda.device_count(): ", torch.cuda.device_count())
 
 class AdaptPreds:
-    def __init__(self, model_no, strategy):
-        self.strategy = strategy
-        self.model_no = model_no
-        self._init_adapter()
-    
-    def _init_adapter(self):
-        self.adapter = self.no_adapt
+    """Normalise any model output into ``(PredictOutput, Optional[SegmentOutput])``.
 
-        if self.strategy == 'AvgSegmentLabel_withGAN' or self.strategy == 'AvgSegmentLabel_withGAN2':
-            if self.model_no == 3:
-                self.adapter = self.adapt_model3_AvgSegmentLabel_withGAN
-                print("Note: Adapter be used to adapt <model3>  for Loss calculator <AvgSegmentLabel_withGAN>")
+    Input formats handled (from oldest to newest):
+
+    * bare ``Tensor``                     → Network0 / 1 / 2
+    * ``dict``                            → legacy single-dict models
+    * ``(dict, None)``                    → Network3
+    * ``(dict, Optional[dict])``          → MuRaL_Network3_addfc3 + variants
+    * ``(Tensor, Tensor, Tensor)``        → legacy (local, distal, fused) tuple
+    * ``(Tensor, Tensor, Tensor, Tensor)``→ legacy (local, mid, distal, fused) tuple
+    * ``(PredictOutput, Optional[SegmentOutput])`` → already normalised (pass-through)
+    """
+
+    def __init__(self, model_no, strategy):
+        self.model_no = model_no
+        self.strategy = strategy
 
     def adapt(self, preds):
-        return self.adapter(preds)
+        return normalize_output(preds)
 
-    def no_adapt(self, preds):
-        if isinstance(preds, dict):
-            return preds, None
+
+def normalize_output(preds):
+    """Normalize a model's raw return to ``(PredictOutput, Optional[SegmentOutput])``."""
+    from MuRaL.models.output import PredictOutput, SegmentOutput
+    import torch
+
+    # already normalised
+    if isinstance(preds, tuple) and isinstance(preds[0], PredictOutput):
         return preds
 
-    def adapt_model3_AvgSegmentLabel_withGAN(self, preds):
-        return preds, None
+    # (dict, optional_seg)  —  current standard format
+    if isinstance(preds, tuple) and len(preds) == 2:
+        main, seg = preds
+        po = _dict_to_predict_output(main)
+        if seg is not None and isinstance(seg, dict):
+            so = SegmentOutput(**{k: v for k, v in seg.items() if hasattr(SegmentOutput, k)})
+        elif isinstance(seg, SegmentOutput):
+            so = seg
+        else:
+            so = None
+        return po, so
+
+    # legacy positional tuples: (local, distal, fused) or (local, mid, distal, fused)
+    if isinstance(preds, tuple) and len(preds) >= 3:
+        po = PredictOutput()
+        if len(preds) == 3:
+            po.local, po.distal, po.out = preds
+        elif len(preds) >= 4:
+            po.local, po.mid, po.distal, po.out = preds[:4]
+        return po, None
+
+    # dict  —  legacy single-dict output
+    if isinstance(preds, dict):
+        return _dict_to_predict_output(preds), None
+
+    # bare Tensor  —  Network0 / 1 / 2
+    if isinstance(preds, torch.Tensor):
+        return PredictOutput(out=preds), None
+
+    return preds
+
+
+def _dict_to_predict_output(d):
+    """Copy known keys from *d* into a new PredictOutput."""
+    from MuRaL.models.output import PredictOutput
+    po = PredictOutput()
+    for k, v in d.items():
+        if hasattr(po, k):
+            setattr(po, k, v)
+    return po
 
 @dataclass
 class BatchConfig:

@@ -2,14 +2,14 @@ import torch
 import time
 
 import torch.nn.functional as F
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2, DirMDNRecoder, GammaMDNRecoder
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2, DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder
 from MuRaL.training.train import TrainerSubject, get_inputs_labels, model_train_register
 
 
 
 
 class Predictor(TrainerSubject):
-    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False) -> None:
+    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False, collect_gamma_total_dirichlet=False) -> None:
 
         super().__init__()
 
@@ -24,6 +24,7 @@ class Predictor(TrainerSubject):
         self.collect_mu_r = collect_mu_r
         self.collect_evidence = collect_evidence
         self.collect_gamma_mdn = collect_gamma_mdn
+        self.collect_gamma_total_dirichlet = collect_gamma_total_dirichlet
 
         if observer is None:
             self.observer = [TimeMinor(out_after_n_batch=1000),LossMinor()]
@@ -44,6 +45,9 @@ class Predictor(TrainerSubject):
             self._dir_mdn_recoder = DirMDNRecoder()
         if collect_gamma_mdn:
             self._gamma_mdn_recoder = GammaMDNRecoder()
+        if collect_gamma_total_dirichlet:
+            self._gamma_total_dirichlet_recoder = GammaTotalDirichletRecoder()
+
 
     def predict(self, dataloader_test):
         self.register_observer(self.valid_preds_recoder)
@@ -54,6 +58,8 @@ class Predictor(TrainerSubject):
             self.register_observer(self._dir_mdn_recoder)
         if self.collect_gamma_mdn:
             self.register_observer(self._gamma_mdn_recoder)
+        if self.collect_gamma_total_dirichlet:
+            self.register_observer(self._gamma_total_dirichlet_recoder)
         self.model.eval()
         valid_step_time = time.time()
         with torch.no_grad():
@@ -84,6 +90,8 @@ class Predictor(TrainerSubject):
             self.remove_observer(self._dir_mdn_recoder)
         if self.collect_gamma_mdn:
             self.remove_observer(self._gamma_mdn_recoder)
+        if self.collect_gamma_total_dirichlet:
+            self.remove_observer(self._gamma_total_dirichlet_recoder)
         return valid_preds
     
     def predict_each_model(self, dataloader_test):
@@ -158,8 +166,10 @@ class Predictor(TrainerSubject):
     def get_pi_entropy(self):
         """返回收集的 pi_entropy 向量。
 
-        仅当 collect_gamma_mdn=True 且模型为 Gamma MDN variant 时返回有效值。
+        兼容 GammaMDNRecoder 和 GammaTotalDirichletRecoder。
         """
+        if hasattr(self, '_gamma_total_dirichlet_recoder'):
+            return self._gamma_total_dirichlet_recoder.output()
         if hasattr(self, '_gamma_mdn_recoder'):
             return self._gamma_mdn_recoder.output()
         return None
@@ -176,14 +186,27 @@ class Predictor(TrainerSubject):
             return self._gamma_mdn_recoder.get_components()
         return None, None, None
 
+    def get_gamma_total_dirichlet_components(self):
+        """返回未激活的 Gamma-Total-Dirichlet 分量。
+
+        - pi_logits:      [B, K], raw
+        - gamma_alpha_raw: [B, K], raw (需 softplus 激活)
+        - gamma_beta_raw:  [B, K], raw (需 softplus 激活)
+        - dir_alpha_raw:   [B, K, 3], raw (需 softplus 激活)
+        """
+        if hasattr(self, '_gamma_total_dirichlet_recoder'):
+            return self._gamma_total_dirichlet_recoder.get_components()
+        return None, None, None, None
+
 def model_predict(batch, model, detach, strategy):
+    from MuRaL.training.train import normalize_output
     if detach:
         cont_x, cat_x, distal_x = batch
-        return model.predict((cont_x, cat_x), distal_x)
+        raw = model.predict((cont_x, cat_x), distal_x)
     else:
-        #return model.forward((cont_x, cat_x), distal_x)
         model_train = model_train_register(strategy)
-        return model_train(batch, model)
+        raw = model_train(batch, model)
+    return normalize_output(raw)
 
 class BayesianPredictor(TrainerSubject):
     def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False) -> None:
