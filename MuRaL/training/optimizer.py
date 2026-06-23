@@ -44,7 +44,7 @@ def get_weight_decay(batch_size, epochs, train_size, weight_decay_auto, weight_d
 
 
 
-def get_lr_scheduler(scheduler_name, optimizer, train_size, config, printer=print):
+def get_lr_scheduler(scheduler_name, optimizer, train_size, config):
     """
     Returns the learning rate scheduler based on the provided configuration.
     
@@ -74,22 +74,15 @@ def get_lr_scheduler(scheduler_name, optimizer, train_size, config, printer=prin
         raise ValueError(f"Unsupported scheduler name '{scheduler_name}'")
 
     # Log the scheduler configuration
-    log_scheduler_info(scheduler_name, config, gamma_rop, printer)
+    log_scheduler_info(scheduler_name, config, gamma_rop)
     
     return schedulers[scheduler_name]
 
-def log_scheduler_info(scheduler_name, config, gamma=None, printer=print):
-    """
-    Log the learning rate scheduler configuration.
-    
-    Args:
-        scheduler_name (str): Name of the scheduler.
-        config (dict): Configuration dictionary.
-        gamma (float, optional): Gamma value for StepLR2, if applicable.
-    """
-    printer(f"Using learning rate scheduler: {scheduler_name}")
+def log_scheduler_info(scheduler_name, config, gamma=None):
+    """Log the learning rate scheduler configuration."""
+    logger.info("Using learning rate scheduler: %s", scheduler_name)
     if scheduler_name == 'StepLR2' and gamma is not None:
-        printer(f"Learning rate gamma for StepLR2: {gamma}")
+        logger.info("Learning rate gamma for StepLR2: %s", gamma)
     if scheduler_name == 'ROP':
-        printer("Using lr_scheduler.ReduceLROnPlateau with patience:", config['patience'])
+        logger.info("Using ReduceLROnPlateau with patience: %s", config['patience'])
 

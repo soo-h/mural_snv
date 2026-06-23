@@ -1,8 +1,11 @@
+import logging
 import torch
 import time
 import sys
 
 from dataclasses import dataclass
+
+logger = logging.getLogger('mural')
 from typing import Dict, Tuple, Any, Callable
 from enum import Enum, auto
 
@@ -28,7 +31,7 @@ class TrainerSubject:
                 self.metrics.update(indicator)
 
 class BayesianTrainer(TrainerSubject):
-    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print) -> None:
+    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None) -> None:
 
         super().__init__()
 
@@ -39,7 +42,6 @@ class BayesianTrainer(TrainerSubject):
         self.device = device
         self.config = config
         self.LossCalculator = loss_calculator
-        self.printer = printer
         self.train_strategy = train_strategy
         self.preds_adapter = AdaptPreds(self.config['model_no'], self.train_strategy)
         self.model_train = model_train_register(self.train_strategy)
@@ -59,7 +61,7 @@ class BayesianTrainer(TrainerSubject):
             self.register_observer(observer)
 
         self.valid_preds_recoder = PredsRecoder()
-        self.contribution_minor = ContributionMinor2(printer=printer)
+        self.contribution_minor = ContributionMinor2()
         self.metrics = {}
 
     def train_step(self, data_loader):
@@ -159,7 +161,7 @@ class BayesianTrainer(TrainerSubject):
             
             self.notify_observers(valid_step_finish = True)
         valid_step_time = time.time() - valid_step_time
-        self.printer(f"Validation used time: {valid_step_time / 60} mins")
+        logger.info("Validation used time: %.1f mins", valid_step_time / 60)
         valid_preds = self.valid_preds_recoder.output()
 
         self.remove_observer(self.valid_preds_recoder)
@@ -171,7 +173,7 @@ class BayesianTrainer(TrainerSubject):
         if self.config['lr_scheduler'] != 'ROP':
             self.scheduler.step()
             if self.optimizer.param_groups[0]['lr'] < self.config['min_lr']:
-                self.printer("optimizer.param_groups[0]:", self.optimizer.param_groups[0]['lr'])
+                logger.debug("optimizer.param_groups[0] lr: %s", self.optimizer.param_groups[0]['lr'])
                 for g in self.optimizer.param_groups:
                     g['lr'] = self.config['restart_lr']
         if self.config['lr_scheduler'] == 'ROP':
@@ -206,7 +208,7 @@ class BayesianTrainer(TrainerSubject):
             return preds
 
 class Trainer(TrainerSubject):
-    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, collect_mu_r=False) -> None:
+    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, collect_mu_r=False) -> None:
 
         super().__init__()
 
@@ -217,7 +219,6 @@ class Trainer(TrainerSubject):
         self.device = device
         self.config = config
         self.LossCalculator = loss_calculator
-        self.printer = printer
         self.train_strategy = train_strategy
         self.preds_adapter = AdaptPreds(self.config['model_no'], self.train_strategy)
         self.model_train = model_train_register(self.train_strategy)
@@ -232,7 +233,7 @@ class Trainer(TrainerSubject):
             self.register_observer(observer)
 
         self.valid_preds_recoder = PredsRecoder()
-        self.contribution_minor = ContributionMinor2(printer=printer)
+        self.contribution_minor = ContributionMinor2()
         self.metrics = {}
 
         if collect_mu_r:
@@ -306,7 +307,7 @@ class Trainer(TrainerSubject):
 
             self.notify_observers(valid_step_finish = True)
         valid_step_time = time.time() - valid_step_time
-        self.printer(f"Validation used time: {valid_step_time / 60} mins")
+        logger.info("Validation used time: %.1f mins", valid_step_time / 60)
         valid_preds = self.valid_preds_recoder.output()
 
         self.remove_observer(self.valid_preds_recoder)
@@ -324,7 +325,7 @@ class Trainer(TrainerSubject):
         if self.config['lr_scheduler'] != 'ROP':
             self.scheduler.step()
             if self.optimizer.param_groups[0]['lr'] < self.config['min_lr']:
-                self.printer("optimizer.param_groups[0]:", self.optimizer.param_groups[0]['lr'])
+                logger.debug("optimizer.param_groups[0] lr: %s", self.optimizer.param_groups[0]['lr'])
                 for g in self.optimizer.param_groups:
                     g['lr'] = self.config['restart_lr']
         if self.config['lr_scheduler'] == 'ROP':
@@ -439,14 +440,9 @@ def weights_init(m):
                     torch.nn.init.xavier_uniform_(m.__getattr__(p))
 
 class TorchBackendManager:
-    def __init__(self, use_dilation=False, input_size_fixed=True, printer=None):
+    def __init__(self, use_dilation=False, input_size_fixed=True):
         self.use_dilation = use_dilation
         self.input_size_fixed = input_size_fixed
-
-        if printer is not None:
-            self.printer = printer
-        else:
-            self.printer = print
 
     def set_torch_backends(self):
         """Configure PyTorch backend settings based on dilation usage."""
@@ -459,15 +455,15 @@ class TorchBackendManager:
 
     def display_torch_backends_info(self):
         """Display the current PyTorch backend settings."""
-        self.printer(f"TF32 Matmul Enabled: {torch.backends.cuda.matmul.allow_tf32}")
-        self.printer(f"CUDNN Benchmark Enabled: {torch.backends.cudnn.benchmark}")
-        self.printer(f"CUDNN TF32 Enabled: {torch.backends.cudnn.allow_tf32}")
-        self.printer(f"CUDNN Deterministic: {torch.backends.cudnn.deterministic}")
+        logger.info("TF32 Matmul Enabled: %s", torch.backends.cuda.matmul.allow_tf32)
+        logger.info("CUDNN Benchmark Enabled: %s", torch.backends.cudnn.benchmark)
+        logger.info("CUDNN TF32 Enabled: %s", torch.backends.cudnn.allow_tf32)
+        logger.info("CUDNN Deterministic: %s", torch.backends.cudnn.deterministic)
 
     def display_torch_device_info(self):
         """Display the current PyTorch device information."""
-        self.printer("torch._C._cuda_getDeviceCount():", torch._C._cuda_getDeviceCount())
-        self.printer("torch.cuda.device_count(): ", torch.cuda.device_count())
+        logger.info("torch._C._cuda_getDeviceCount(): %s", torch._C._cuda_getDeviceCount())
+        logger.info("torch.cuda.device_count(): %s", torch.cuda.device_count())
 
 class AdaptPreds:
     """Normalise any model output into ``(PredictOutput, Optional[SegmentOutput])``.

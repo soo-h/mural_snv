@@ -1,5 +1,8 @@
+import logging
 import warnings
 import os
+
+logger = logging.getLogger('mural')
 import pickle
 import time
 import copy
@@ -887,10 +890,9 @@ class DistalFeatureSource(FeatureSource):
 
 
 class DatasetPreprocessor:
-    def __init__(self, preprocess_config, use_h5, printer=print):
+    def __init__(self, preprocess_config, use_h5):
         self.config = preprocess_config
         self.use_h5 = use_h5
-        self.printer = print
 
     def preprocess_dataset(self, bed_path, ref_genome, use_segment_task=False):
         bed = self.read_bed_file(bed_path)
@@ -907,7 +909,7 @@ class DatasetPreprocessor:
     def _process_h5(self, bed_file, ref_genome, bw_files, bw_names, bw_radii, use_segment_task):
         # H5 specific logic
         if use_segment_task:
-            self.printer("Warning: segment_task is not supported with H5 files. Ignoring segment_task.")
+            logger.warning("segment_task is not supported with H5 files. Ignoring segment_task.")
 
         step_stime = time.time()
         chunk_size = 5000
@@ -918,20 +920,20 @@ class DatasetPreprocessor:
                                      chunk_size=chunk_size, seq_only=self.config['seq_only'],
                                      n_h5_files=self.config['n_h5_files'],
                                      without_bw_distal=self.config['without_bw_distal'])
-        self.printer(f"{bed_file.fn} preprocess with H5 used time:", (time.time() - step_stime))
+        logger.info("%s preprocess with H5 used time: %.2f", bed_file.fn, (time.time() - step_stime))
         return dataset
 
 
     def _process_np(self, bed_regions, ref_genome):
         # Non-H5 logic
-        self.printer('using numpy/pandas for distal_seq ...')
+        logger.info('using numpy/pandas for distal_seq ...')
         step_stime = time.time()
         dataset = prepare_dataset_npv3(bed_regions, ref_genome, config=self.config)
 
         #if segment_task and not prediction:
             #self._save_segment_task(segment_task, self.config['trial_dir'])
 
-        self.printer(f"preprocess without H5 used time:", (time.time() - step_stime))
+        logger.info("preprocess without H5 used time: %.2f", (time.time() - step_stime))
         return dataset   
     
     def _save_segment_task(self, segment_task, trial_dir):
@@ -952,11 +954,11 @@ class DatasetPreprocessor:
                 else:
                     bw_radii = [self.config['local_radius']]*len(bw_files)
             
-                self.printer("bw_radii:", bw_radii)
+                logger.info("bw_radii: %s", bw_radii)
             except pd.errors.EmptyDataError:
-                self.printer('Warnings: no bigWig files provided in', bw_paths)
+                logger.warning('no bigWig files provided in %s', bw_paths)
         else:
-            self.printer('NOTE: no bigWig files provided.')
+            logger.info('NOTE: no bigWig files provided.')
         return bw_files, bw_names, bw_radii
     
     def read_bed_file(self, file_path):

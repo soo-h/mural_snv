@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import random
+import logging
 import warnings
 from typing import Dict, Any, Union
 
@@ -21,23 +22,24 @@ from scipy.stats import pearsonr
 
 
 from MuRaL.data.data_preprocess_pipeline import DatasetPreprocessor
-from MuRaL.utils.printer_utils import get_printer
+from MuRaL.utils.log_utils import setup_logging, get_logger
 from MuRaL.models.nn_models import *
 from MuRaL.models.nn_utils import *
 from MuRaL.evaluation.evaluation import *
 from MuRaL.data.preprocessing import *
 from MuRaL.data.dataset import dict_to_tuple_collate
 from MuRaL.models.custom_loss import *
-from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss
+from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss, PoissonGammaMDNClassificationLoss, GammaTotalDirichletSubtypeLoss, PoissonGammaLogClassificationLoss, PoissonExactClassificationLoss
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
 from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, DirMDNRecoder, GammaMDNRecoder
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder, GammaLambdaRecoder
 from MuRaL.utils.config_utils import read_bnn_config, read_feature_config
 
 sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
 from model_config import ModelFactory
 
-warnings.filterwarnings('ignore',category=FutureWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+logger = get_logger(__name__)
 
 def set_seed(seed):
     random.seed(seed)
@@ -73,10 +75,10 @@ def train(config, args, checkpoint_dir=None):
     args.segment_task = None
     n_class = args.n_class
 
-    if not args.use_ray:
-        print = get_printer(args.use_ray, args.trial_training_log)
-    
-    torch_backend_manager = TorchBackendManager(args.use_dilation, args.cudnn_benchmark_false, printer=print)
+    logdir = os.path.dirname(args.trial_training_log) if args.trial_training_log else None
+    setup_logging(logdir=logdir, debug=args.debug, use_ray=args.use_ray)
+
+    torch_backend_manager = TorchBackendManager(args.use_dilation, args.cudnn_benchmark_false)
     torch_backend_manager.set_torch_backends()
     torch_backend_manager.display_torch_device_info()
 
@@ -99,10 +101,10 @@ def train(config, args, checkpoint_dir=None):
     feature_config = read_feature_config(args.feature_config)
     # two sequence features must used: local and distal
     use_segment_task = True if (len(feature_config['features']) > 2 or args.use_segment_task) else False
-    print("use_segment_task:", use_segment_task)
+    logger.info("use_segment_task: %s", use_segment_task)
 
     preprocess_config.update(feature_config)
-    preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5, printer=print)
+    preprocessor_pipline = DatasetPreprocessor(preprocess_config, use_h5=args.with_h5)
     # 2026.0516
     calc_loss_strategy_name = args.calc_loss_strategy_name 
     # calc_loss_strategy_name = "AvgStepMutAndKmerMutUseInLocal" if args.calc_loss_strategy_name is None else args.calc_loss_strategy_name
@@ -113,13 +115,14 @@ def train(config, args, checkpoint_dir=None):
         dataset_valid = preprocessor_pipline.preprocess_dataset(args.validation_data, args.ref_genome, use_segment_task=use_segment_task)
         dataset_train = dataset
     else:
-        print("Error: validation should provided.")
+        logger.error("Validation data required but not provided.")
+        sys.exit(1)
     
     data_local = dataset_train.data_local.reset_index(drop=True)
     data_local_valid = dataset_valid.data_local.reset_index(drop=True)
     train_size = len(data_local)
     valid_size = len(data_local_valid)
-    print("train_size, valid_size: ", train_size, valid_size)
+    logger.info("train_size: %d, valid_size: %d", train_size, valid_size)
 
     # data loader
     segment_workers = args.cpu_per_trial - 1
@@ -136,7 +139,8 @@ def train(config, args, checkpoint_dir=None):
     if args.gpu_per_trial > 0:
         # Set the device
         if not torch.cuda.is_available():
-            print('Warning: You requested GPU computing, but CUDA is not available! If you want to run without GPU, please set "--ray_ngpus 0 --gpu_per_trial 0"', file=sys.stderr)
+            logger.warning('GPU requested but CUDA is not available. '
+                           'Set --ray_ngpus 0 --gpu_per_trial 0 for CPU-only.')
         if not args.use_ray:
             if torch.cuda.is_available():
                 device = torch.device(f'cuda:{args.cuda_id}' if torch.cuda.is_available() else 'cpu')
@@ -171,8 +175,7 @@ def train(config, args, checkpoint_dir=None):
     if not args.use_bayesian:
         model.to(device)
     total_params = count_parameters(model)
-    print("model:" )
-    print(model)
+    logger.info("Model architecture:\n%s", model)
 
     # loss and optimizer
     loss_factory = LossFactory()
@@ -210,15 +213,15 @@ def train(config, args, checkpoint_dir=None):
     optimizer = get_optimizer(config['optim'], model, config['learning_rate'], config['weight_decay'])
     scheduler = get_lr_scheduler(config['lr_scheduler'], optimizer, train_size, config)
 
-    print('optimizer:', optimizer)
-    print('scheduler:', scheduler)
+    logger.info('optimizer: %s', optimizer)
+    logger.info('scheduler: %s', scheduler)
     sys.stdout.flush()
 
     chr_pos = get_position_info(BedTool(args.validation_data), config['segment_center'])
 
-    Observer = [TimeMinor(out_after_n_batch=1000, printer=print), 
-                GradMinor(out_after_n_batch=1000, printer=print), 
-                LossMinor(calc_loss_strategy_name, printer=print)]
+    Observer = [TimeMinor(out_after_n_batch=1000),
+                GradMinor(out_after_n_batch=1000),
+                LossMinor()]
 
     if args.use_bayesian:
         from MuRaL.training.train import BayesianTrainer
@@ -228,13 +231,12 @@ def train(config, args, checkpoint_dir=None):
         # wrap DNN to BNN, only support liner and conv layers
         dnn_to_bnn(model, const_bnn_prior_parameters)
         model.to(device)
-        print("bnn model:" )
-        print(model)
+        logger.info("BNN model architecture:\n%s", model)
         trainer = BayesianTrainer(model, optimizer, scheduler, loss_calculator, criterion, device, config,
-                                  observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
+                                  observer=Observer, train_strategy=calc_loss_strategy_name)
     else:
         trainer = Trainer(model, optimizer, scheduler, loss_calculator, criterion, device, config,
-                          observer=Observer, printer=print, train_strategy=calc_loss_strategy_name,
+                          observer=Observer, train_strategy=calc_loss_strategy_name,
                           collect_mu_r=is_nb)
 
     dir_mdn_recoder = DirMDNRecoder() if is_dir_mdn else None
@@ -253,7 +255,7 @@ def train(config, args, checkpoint_dir=None):
         if args.use_bayesian:
             valid_y_prob, valid_y_std = trainer.valid_step(dataloader_valid)
             valid_y_prob = to_np(valid_y_prob)
-            print("valid_y_std 0:10 :", valid_y_std[:10])
+            logger.debug("valid_y_std 0:10: %s", valid_y_std[:10])
         
         else:
             if is_dir_mdn:
@@ -307,17 +309,17 @@ def train(config, args, checkpoint_dir=None):
 
         # Evaluation- Kmer
         if is_nb:
-            evaluator_before_calibra = NBEvaluator(data_local_valid, valid_y_prob, n_class, mu=valid_mu, r=valid_r, use_obs_count=args.recurrent, printer=print)
-            evaluator_after_calibra = NBEvaluator(data_local_valid, prob_cal, n_class, mu=valid_mu, r=valid_r, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
+            evaluator_before_calibra = NBEvaluator(data_local_valid, valid_y_prob, n_class, mu=valid_mu, r=valid_r, use_obs_count=args.recurrent)
+            evaluator_after_calibra = NBEvaluator(data_local_valid, prob_cal, n_class, mu=valid_mu, r=valid_r, calibra="FullDiri", use_obs_count=args.recurrent)
         elif is_gamma_mdn:
-            evaluator_before_calibra = GammaMDNEvaluator(data_local_valid, valid_y_prob, n_class, pi_entropy=valid_pi_entropy, use_obs_count=args.recurrent, printer=print)
-            evaluator_after_calibra = GammaMDNEvaluator(data_local_valid, prob_cal, n_class, pi_entropy=valid_pi_entropy, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
+            evaluator_before_calibra = GammaMDNEvaluator(data_local_valid, valid_y_prob, n_class, pi_entropy=valid_pi_entropy, use_obs_count=args.recurrent)
+            evaluator_after_calibra = GammaMDNEvaluator(data_local_valid, prob_cal, n_class, pi_entropy=valid_pi_entropy, calibra="FullDiri", use_obs_count=args.recurrent)
         elif is_dir_mdn:
-            evaluator_before_calibra = DirMDNEvaluator(data_local_valid, valid_y_prob, n_class, evidence=valid_evidence, use_obs_count=args.recurrent, printer=print)
-            evaluator_after_calibra = DirMDNEvaluator(data_local_valid, prob_cal, n_class, evidence=valid_evidence, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
+            evaluator_before_calibra = DirMDNEvaluator(data_local_valid, valid_y_prob, n_class, evidence=valid_evidence, use_obs_count=args.recurrent)
+            evaluator_after_calibra = DirMDNEvaluator(data_local_valid, prob_cal, n_class, evidence=valid_evidence, calibra="FullDiri", use_obs_count=args.recurrent)
         else:
-            evaluator_before_calibra = Evaluator(data_local_valid, valid_y_prob, n_class, use_obs_count=args.recurrent, printer=print)
-            evaluator_after_calibra = Evaluator(data_local_valid, prob_cal, n_class, calibra="FullDiri", use_obs_count=args.recurrent, printer=print)
+            evaluator_before_calibra = Evaluator(data_local_valid, valid_y_prob, n_class, use_obs_count=args.recurrent)
+            evaluator_after_calibra = Evaluator(data_local_valid, prob_cal, n_class, calibra="FullDiri", use_obs_count=args.recurrent)
 
         evaluator_before_calibra.evaluate_kmer()
         evaluator_after_calibra.evaluate_kmer()
@@ -328,12 +330,12 @@ def train(config, args, checkpoint_dir=None):
 
         if is_gamma_mdn:
             evaluator_before_calibra.evaluate_entropy_calibration()
-            print("After calibration:")
+            logger.info("After calibration:")
             evaluator_after_calibra.evaluate_entropy_calibration()
 
         if is_dir_mdn:
             evaluator_before_calibra.evaluate_evidence_calibration()
-            print("After calibration:")
+            logger.info("After calibration:")
             evaluator_after_calibra.evaluate_evidence_calibration()
 
         evaluator_before_calibra.evaluate_regional_score(valid_size)
@@ -375,30 +377,30 @@ def train(config, args, checkpoint_dir=None):
         if not args.use_ray:
             early_stopping(minor_metrics['current_valid_loss'], model)
             if early_stopping.early_stop:
-                print(f"Epoch {epoch} used time:{time.time()-epoch_time} seconds!")
-                print("Early stopping")
+                logger.info("Epoch %d used time: %.1f seconds", epoch, time.time() - epoch_time)
+                logger.info("Epoch %d used time: %.1f seconds (early stopping)", epoch, time.time() - epoch_time)
                 break
 
         if config['lr_scheduler'] == 'ROP':
             scheduler.step(minor_metrics['current_valid_loss'])
         torch.cuda.empty_cache() 
             
-        print(f"Epoch {epoch} used time:{time.time()-epoch_time} seconds!")
+        logger.info("Epoch %d used time: %.1f seconds", epoch, time.time() - epoch_time)
         sys.stdout.flush()
 
         dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=use_segment_task)
         dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=use_segment_task)
 
 
-    print(f"dital_radius: {args.distal_radius} training finish, {epoch} epochs total time:{time.time()-start_time} min!")
+    logger.info("distal_radius: %s training finished, %d epochs total time: %.1f min", args.distal_radius, epoch + 1, (time.time() - start_time) / 60)
     best_epoch = epoch - early_stopping.counter
-    print(f"Best Epoch: {best_epoch}")
+    logger.info("Best Epoch: %d", best_epoch)
 
 def freeze_without_large_scale_model(model):
     for name, param in model.named_parameters():
         if 'large_scale_model' not in name:
             param.requires_grad = False
-            print(f'Freeze parameter: {name}')
+            logger.debug('Freeze parameter: %s', name)
 
 def model_load(model, load_path, freeze, device):
     model_state = torch.load(load_path, map_location=device)
@@ -437,12 +439,12 @@ def get_save_path(use_ray, trial_dir, epoch):
     return path
 
 class Evaluator:
-    def __init__(self, data_local, y_prob, n_class, calibra=None, use_obs_count=False, printer=print):
+    def __init__(self, data_local, y_prob, n_class, calibra=None, use_obs_count=False):
         self.n_class = n_class
         self.prob_names = ['prob'+str(i) for i in range(n_class)]
         self.data_local = data_local
         self.y_prob = y_prob
-        self.printer = printer
+        
         self.calibra = calibra
         self.use_obs_count = use_obs_count
         self.data_and_prob = self.preprocess()
@@ -472,10 +474,10 @@ class Evaluator:
 
     def evaluate_kmer(self, kmer_list=[3,5,7]):
         if self.calibra is None:
-            self.printer("valid_data_and_prob.iloc[0:10]", self.data_and_prob.iloc[0:10])
+            logger.info("valid_data_and_prob.iloc[0:10]", self.data_and_prob.iloc[0:10])
         for k in kmer_list:
             kmer_corr = freq_kmer_comp_multi(self.data_and_prob, k, self.n_class, self.use_obs_count)
-            self.printer(f"{k}{self.kmer_out_identify}", kmer_corr)
+            logger.info(f"{k}{self.kmer_out_identify}", kmer_corr)
     
     def evaluate_regional_corr(self, chr_pos, win_size_list=[100000, 500000], save_valid_preds=False, save_path=None):
         cols = self.prob_names + (['sample_weight'] if self.use_obs_count else [])
@@ -492,11 +494,11 @@ class Evaluator:
         valid_pred_df.reset_index(drop=True, inplace=True)
 
         if self.calibra is None:
-            self.printer('valid_pred_df: ', valid_pred_df.head())
+            logger.info('valid_pred_df: ', valid_pred_df.head())
 
         for win_size in win_size_list:
             corr_win = corr_calc_sub(valid_pred_df, win_size, self.prob_names, self.use_obs_count)
-            self.printer(self.regional_out_identify, str(win_size)+'bp', corr_win)
+            logger.info(self.regional_out_identify, str(win_size)+'bp', corr_win)
 
         if save_valid_preds:
             save_cols = ['chrom', 'start', 'end', 'strand', 'mut_type'] + self.prob_names
@@ -508,7 +510,7 @@ class Evaluator:
         else:
             region_size = valid_size // 10
         n_regions = valid_size // region_size
-        self.printer('n_regions:', n_regions)
+        logger.info('n_regions:', n_regions)
 
         score = 0
         corr_3mer = []
@@ -532,13 +534,13 @@ class Evaluator:
             corr_list.append(region_avg[i].corr(region_avg[i + self.n_class]))
 
         if self.calibra is None:    
-            self.printer('corr_list:', corr_list)
+            logger.info('corr_list:', corr_list)
             #print('corr_3mer:', corr_3mer)
             #print('corr_5mer:', corr_5mer)
-            self.printer('regional score:', score, n_regions)
+            logger.info('regional score:', score, n_regions)
         else:
-            self.printer('corr_list(after fdiri_cal)', corr_list)
-            self.printer('regional score(after fdiri_cal)', score, n_regions)
+            logger.info('corr_list(after fdiri_cal)', corr_list)
+            logger.info('regional score(after fdiri_cal)', score, n_regions)
         
         self.metrics['score'] = score
 
@@ -546,8 +548,8 @@ class Evaluator:
 class NBEvaluator(Evaluator):
     """Evaluator 子类，增加 μ、r、方差评估。"""
 
-    def __init__(self, data_local, y_prob, n_class, mu=None, r=None, calibra=None, use_obs_count=False, printer=print):
-        super().__init__(data_local, y_prob, n_class, calibra=calibra, use_obs_count=use_obs_count, printer=printer)
+    def __init__(self, data_local, y_prob, n_class, mu=None, r=None, calibra=None, use_obs_count=False):
+        super().__init__(data_local, y_prob, n_class, calibra=calibra, use_obs_count=use_obs_count)
 
         self.mu_names = ['mu'+str(i) for i in range(n_class)]
         self.r_names = ['r'+str(i) for i in range(n_class)]
@@ -558,16 +560,16 @@ class NBEvaluator(Evaluator):
             r_df = pd.DataFrame(r, columns=self.r_names)
             # Var = μ + μ²/r
             var = mu + mu**2 / np.maximum(r, 1e-8)
-            self.printer("calc mu by NegBinomial: ", mu.mean(axis=0))
-            self.printer("calc r by NegBinomial: ", r.mean(axis=0))
-            self.printer("calc var by NegBinomial: ", var.mean(axis=0))
+            logger.info("calc mu by NegBinomial: ", mu.mean(axis=0))
+            logger.info("calc r by NegBinomial: ", r.mean(axis=0))
+            logger.info("calc var by NegBinomial: ", var.mean(axis=0))
             var_df = pd.DataFrame(var, columns=self.var_names)
             self.data_and_prob = pd.concat([self.data_and_prob, mu_df, r_df, var_df], axis=1)
 
     def evaluate_kmer_var(self, kmer_list=[3]):
         """按 k-mer 聚合 μ、r、方差，输出每类均值。"""
         if not hasattr(self, 'mu_names'):
-            self.printer("NBEvaluator: no mu/r data, skip evaluate_kmer_var.")
+            logger.info("NBEvaluator: no mu/r data, skip evaluate_kmer_var.")
             return
 
         for k in kmer_list:
@@ -577,8 +579,8 @@ class NBEvaluator(Evaluator):
             grouped = self.data_and_prob.groupby(mer_list)
             result = grouped[self.mu_names + self.r_names + self.var_names].mean()
 
-            self.printer(f"\n--- {k}mer μ/r/var ---")
-            self.printer(result)
+            logger.info(f"\n--- {k}mer μ/r/var ---")
+            logger.info(result)
 
 
 class DirMDNEvaluator(Evaluator):
@@ -589,14 +591,14 @@ class DirMDNEvaluator(Evaluator):
     - Report accuracy, confidence, and mean evidence per bin
     """
 
-    def __init__(self, data_local, y_prob, n_class, evidence=None, calibra=None, use_obs_count=False, printer=print):
-        super().__init__(data_local, y_prob, n_class, calibra=calibra, use_obs_count=use_obs_count, printer=printer)
+    def __init__(self, data_local, y_prob, n_class, evidence=None, calibra=None, use_obs_count=False):
+        super().__init__(data_local, y_prob, n_class, calibra=calibra, use_obs_count=use_obs_count)
         self.evidence = evidence
 
     def evaluate_evidence_calibration(self, n_bins=10):
         """Evaluate evidence-based reliability by percentile binning."""
         if self.evidence is None:
-            self.printer("DirMDNEvaluator: no evidence data, skip evaluate_evidence_calibration.")
+            logger.info("DirMDNEvaluator: no evidence data, skip evaluate_evidence_calibration.")
             return
 
         y_true = self.data_local['mut_type'].values
@@ -618,10 +620,10 @@ class DirMDNEvaluator(Evaluator):
             ev = self.evidence[mask].mean()
             results.append((i, acc, conf, ev))
 
-        self.printer(f"\n--- Evidence Calibration ({n_bins} bins) ---")
-        self.printer(f"{'Bin':>5} {'Acc':>8} {'Conf':>8} {'Evidence':>10}")
+        logger.info(f"\n--- Evidence Calibration ({n_bins} bins) ---")
+        logger.info(f"{'Bin':>5} {'Acc':>8} {'Conf':>8} {'Evidence':>10}")
         for i, acc, conf, ev in results:
-            self.printer(f"{i:>5} {acc:>8.4f} {conf:>8.4f} {ev:>10.4f}")
+            logger.info(f"{i:>5} {acc:>8.4f} {conf:>8.4f} {ev:>10.4f}")
 
 
 class GammaMDNEvaluator(Evaluator):
@@ -631,16 +633,15 @@ class GammaMDNEvaluator(Evaluator):
     observed density vs predicted mean correlation across pi_entropy bins.
     """
 
-    def __init__(self, data_local, y_prob, n_class, pi_entropy=None, calibra=None,
-                 use_obs_count=False, printer=print):
+    def __init__(self, data_local, y_prob, n_class, pi_entropy=None, calibra=None, use_obs_count=False):
         super().__init__(data_local, y_prob, n_class, calibra=calibra,
-                         use_obs_count=use_obs_count, printer=printer)
+                         use_obs_count=use_obs_count)
         self.pi_entropy = pi_entropy
 
     def evaluate_entropy_calibration(self, n_bins=10):
         """Evaluate per-mutation-type obs-density vs pred-mean correlation across entropy bins."""
         if self.pi_entropy is None:
-            self.printer("GammaMDNEvaluator: no pi_entropy data, skip evaluate_entropy_calibration.")
+            logger.info("GammaMDNEvaluator: no pi_entropy data, skip evaluate_entropy_calibration.")
             return None
 
         pi_entropy_np = self.pi_entropy
@@ -697,14 +698,14 @@ class GammaMDNEvaluator(Evaluator):
             if len(obs_vals) >= 3:
                 corr = np.corrcoef(obs_vals, pred_vals)[0, 1]
                 correlations[f'prob{c}_corr'] = corr
-                self.printer(f"  prob{c} obs vs pred correlation: {corr:.4f}")
+                logger.info(f"  prob{c} obs vs pred correlation: {corr:.4f}")
             else:
                 correlations[f'prob{c}_corr'] = None
 
         return correlations
 
     def _print_bin_results(self, records, n_probs):
-        self.printer(f"\n--- Entropy Calibration ({len(records)} bins) ---")
+        logger.info(f"\n--- Entropy Calibration ({len(records)} bins) ---")
         for row in records:
             parts = [
                 f"  bin{row['bin']+1} {row['bin_label']}: "
@@ -715,7 +716,7 @@ class GammaMDNEvaluator(Evaluator):
                     f"  prob{c}_obs={row[f'prob{c}_obs_density']:.6f}  "
                     f"prob{c}_pred={row[f'prob{c}_pred_mean']:.6f}"
                 )
-            self.printer(''.join(parts))
+            logger.info(''.join(parts))
 
 
 def save_model(model, fdiri_cal, config, save_path):
@@ -736,7 +737,7 @@ def report_metrics(metrics, report_path=None):
                 f.write(f"{key}: {value}\n")
     else:
         for key, value in metrics.items():
-            print(f"{key}: {value}")
+            logger.info("%s: %s", key, value)
 
 def report_ac_prob_correlation(valid_y_prob, n_class=7, n_sub=3):
     """
@@ -757,11 +758,11 @@ def report_ac_prob_correlation(valid_y_prob, n_class=7, n_sub=3):
         acgt_prob = valid_y_prob[:, acgt_start + i]
 
         corr, _ = pearsonr(ac1_prob, acgt_prob)
-        print(f"AC=1 and AC>1 subtype {i+1} correlation: {corr:.4f}")
+        logger.info("AC=1 and AC>1 subtype %d correlation: %.4f", i + 1, corr)
 
     # summed correlation
     ac1_sum = valid_y_prob[:, ac1_start:ac1_start + n_sub].sum(axis=1)
     acgt_sum = valid_y_prob[:, acgt_start:acgt_start + n_sub].sum(axis=1)
 
     corr, _ = pearsonr(ac1_sum, acgt_sum)
-    print(f"AC=1 and AC>1 probs sum correlation: {corr:.4f}")
+    logger.info("AC=1 and AC>1 probs sum correlation: %.4f", corr)

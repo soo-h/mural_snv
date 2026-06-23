@@ -1,5 +1,8 @@
+import logging
 import torch
 import time
+
+logger = logging.getLogger('mural')
 
 import torch.nn.functional as F
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2, DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder
@@ -9,7 +12,7 @@ from MuRaL.training.train import TrainerSubject, get_inputs_labels, model_train_
 
 
 class Predictor(TrainerSubject):
-    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False, collect_gamma_total_dirichlet=False) -> None:
+    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, detach=False, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False, collect_gamma_total_dirichlet=False) -> None:
 
         super().__init__()
 
@@ -18,7 +21,6 @@ class Predictor(TrainerSubject):
         self.device = device
         self.config = config
         self.LossCalculator = loss_calculator
-        self.printer = printer
         self.train_strategy = train_strategy
         self.detach = detach
         self.collect_mu_r = collect_mu_r
@@ -79,7 +81,7 @@ class Predictor(TrainerSubject):
 
             self.notify_observers(valid_step_finish = True)
         valid_step_time = time.time() - valid_step_time
-        self.printer(f"Validation used time: {valid_step_time / 60} mins")
+        logger.info("Prediction used time: %.1f mins", valid_step_time / 60)
         valid_preds = self.valid_preds_recoder.output()
 
         self.remove_observer(self.valid_preds_recoder)
@@ -117,7 +119,7 @@ class Predictor(TrainerSubject):
             
             self.notify_observers(valid_step_finish = True)
         valid_step_time = time.time() - valid_step_time
-        self.printer(f"Validation used time: {valid_step_time / 60} mins")
+        logger.info("Prediction used time: %.1f mins", valid_step_time / 60)
         valid_preds = self.each_model_preds_recoder.output()
 
         self.remove_observer(self.each_model_preds_recoder)
@@ -209,7 +211,7 @@ def model_predict(batch, model, detach, strategy):
     return normalize_output(raw)
 
 class BayesianPredictor(TrainerSubject):
-    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, printer=print, detach=False) -> None:
+    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, detach=False) -> None:
 
         super().__init__()
 
@@ -218,7 +220,6 @@ class BayesianPredictor(TrainerSubject):
         self.device = device
         self.config = config
         self.LossCalculator = loss_calculator
-        self.printer = printer
         self.train_strategy = train_strategy
         self.detach = detach
         self.num_monte_carlo = self.config.get('num_monte_carlo', 10)
@@ -275,7 +276,7 @@ class BayesianPredictor(TrainerSubject):
             
             self.notify_observers(valid_step_finish = True)
         valid_step_time = time.time() - valid_step_time
-        self.printer(f"Validation used time: {valid_step_time / 60} mins")
+        logger.info("Prediction used time: %.1f mins", valid_step_time / 60)
         valid_preds = self.valid_preds_recoder.output()
 
         self.remove_observer(self.valid_preds_recoder)

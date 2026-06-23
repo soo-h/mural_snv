@@ -33,7 +33,6 @@ import time
 import datetime
 import random
 
-from MuRaL.utils.printer_utils import get_printer
 from MuRaL.utils.gpu_utils import get_available_gpu, check_cuda_id
 from MuRaL.models.nn_models import *
 from MuRaL.models.nn_utils import *

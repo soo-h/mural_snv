@@ -1,7 +1,10 @@
+import logging
 import time
 import numpy as np
 import sys
 import torch
+
+logger = logging.getLogger('mural')
 from MuRaL.evaluation.gradient_utils import print_gradients, print_gradient_norms
 
 from typing import Dict, Any, Union
@@ -14,14 +17,13 @@ class Observer:
 
 
 class TimeMinor(Observer):
-    def __init__(self, out_after_n_batch, dataset_clss='Training', printer=print):
+    def __init__(self, out_after_n_batch, dataset_clss='Training'):
         self.batch_load_times = []
         self.batch_train_times = []
         self.batch_total_times = []
         self.conter = 0
         self.out_after_n_batch = out_after_n_batch
         self.dataset_clss = dataset_clss
-        self.printer = printer
     
     def record_batch_load(self, time):
         self.batch_load_times.append(time)
@@ -33,9 +35,9 @@ class TimeMinor(Observer):
         self.batch_total_times.append(time)
 
     def out_batch_times(self):
-        self.printer(f"{self.dataset_clss} load {self.out_after_n_batch} batch used {np.sum(self.batch_load_times) / 60} min")
-        self.printer(f"{self.dataset_clss} train {self.out_after_n_batch} batch used {np.sum(self.batch_train_times) / 60} min")
-        self.printer(f"{self.dataset_clss} after {self.out_after_n_batch} batch used {np.sum(self.batch_total_times) / 60} min")
+        logger.debug("%s load %d batch used %.2f min", self.dataset_clss, self.out_after_n_batch, np.sum(self.batch_load_times) / 60)
+        logger.debug("%s train %d batch used %.2f min", self.dataset_clss, self.out_after_n_batch, np.sum(self.batch_train_times) / 60)
+        logger.debug("%s after %d batch used %.2f min", self.dataset_clss, self.out_after_n_batch, np.sum(self.batch_total_times) / 60)
         self.reset()
 
     def reset(self):
@@ -64,7 +66,7 @@ class TimeMinor(Observer):
                 self.out_batch_times()
 
 class GradMinor(Observer):
-    def __init__(self, out_after_n_batch, first_epoch=True, printer=print):
+    def __init__(self, out_after_n_batch, first_epoch=True):
         self.grad_norms = []
         self.counter = 0
         self.out_after_n_batch = out_after_n_batch
@@ -72,11 +74,11 @@ class GradMinor(Observer):
             self.out_epoch = 5
         else:
             self.out_epoch = 0
-        self.printer = printer
     
     def out_grad(self, model):
-        print_gradients(model, print=self.printer)
-        print_gradient_norms(model, print=self.printer)
+        logger.debug("Layer-wise Gradient Distribution:")
+        print_gradients(model, print=logger.debug)
+        print_gradient_norms(model, print=logger.debug)
         self.reset()
 
     def reset(self):
@@ -99,8 +101,7 @@ class UniversalLossRecorder:
     Keys are discovered dynamically from the first recorded batch.
     """
 
-    def __init__(self, printer=print):
-        self.printer = printer
+    def __init__(self):
         self.keys = None
         self._init_buffers()
 
@@ -144,8 +145,7 @@ class UniversalLossRecorder:
         for k in self.keys:
             if self._buffers[k]:
                 arr = np.array(self._buffers[k])
-                self.printer(f"{dataset_class} {k}: {arr.sum() / sample_number}; "
-                             f"Batch Var: {arr.var()}")
+                logger.info("%s %s: %.4f; Batch Var: %.4f", dataset_class, k, arr.sum() / sample_number, arr.var())
         k = 'total_loss' if 'total_loss' in (self.keys or []) else 'loss'
         if self.keys and k in self.keys and self._buffers.get(k):
             total = np.sum(self._buffers[k])
@@ -165,20 +165,17 @@ class UniversalLossRecorder:
             names = labels.get(len(first), [f'loss_{i}' for i in range(len(first))])
             for i, name in enumerate(names):
                 vals = [row[i] for row in self._tuple_losses]
-                self.printer(f"{dataset_class} {name} Loss: {np.sum(vals) / sample_number}; "
-                             f"Batch Var: {np.var(vals)}")
+                logger.info("%s %s Loss: %.4f; Batch Var: %.4f", dataset_class, name, np.sum(vals) / sample_number, np.var(vals))
             return np.sum([row[-1] for row in self._tuple_losses])
         else:
             total = np.sum(self._tuple_losses)
-            self.printer(f"{dataset_class} Total Loss: {total / sample_number}; "
-                         f"Batch Var: {np.var(self._tuple_losses)}")
+            logger.info("%s Total Loss: %.4f; Batch Var: %.4f", dataset_class, total / sample_number, np.var(self._tuple_losses))
             return total
 
 
 class LossMinor(Observer):
-    def __init__(self, printer=print):
-        self.loss_strategy = UniversalLossRecorder(printer=printer)
-        self.printer = printer
+    def __init__(self):
+        self.loss_strategy = UniversalLossRecorder()
         self.sample_number = 0
 
     def record_loss(self, loss):
@@ -210,14 +207,13 @@ class LossMinor(Observer):
         
 
 class ModelSaverObserve(Observer):
-    def __init__(self, model_saver, printer=print):
+    def __init__(self, model_saver):
         self.model_saver = model_saver
-        self.printer = printer
 
     def update(self, **kwargs):
         if 'epoch_finish' in kwargs:
             self.model_saver.save_model(kwargs['epoch_finish'])
-            self.printer(f"Model saved at epoch {kwargs['epoch_finish']}")
+            logger.info("Model saved at epoch %s", kwargs['epoch_finish'])
 
 class PredsRecoder(Observer):
 
@@ -486,10 +482,9 @@ class SubModelPredResRecoder(Observer):
 
 
 class ContributionMinor(Observer):
-    def __init__(self, printer=print):
+    def __init__(self):
         self.mean_contributions = None
         self.calc_var_contributions = None
-        self.printer = printer
 
     def record(self, preds_each_model: dict):
 
@@ -605,14 +600,14 @@ class ContributionMinor(Observer):
     
     def out_contribution(self):
         if self.mean_contributions is None:
-            self.printer("Only one preds out, No contribution to report.")
+            logger.debug("Only one preds out, No contribution to report.")
             return
 
         for model_name, contribution in self.mean_contributions.items():
-            self.printer(f"{model_name} Mean abs contribution in validation:", np.mean(contribution, axis=0))
+            logger.debug("%s Mean abs contribution: %s", model_name, np.mean(contribution, axis=0))
 
         for model_name, contribution in self.var_contributions.items():
-            self.printer(f"{model_name} Mean Var in validation:", np.mean(contribution, axis=0))
+            logger.debug("%s Mean Var: %s", model_name, np.mean(contribution, axis=0))
 
     def update(self, **kwargs):
         if 'valid_preds' in kwargs:
@@ -636,7 +631,7 @@ class ContributionMinor2_(Observer):
     def __init__(self, printer=print):
         self.mean_contributions = None
         self.var_contributions = None
-        self.printer = printer
+        
 
     # ===== 主功能方法 =====
     def update(self, **kwargs):
@@ -736,10 +731,10 @@ class ContributionMinor2_(Observer):
             existing[model_name] = np.concatenate([existing[model_name], contribution],axis=0)
 
     def _print_contribution(self, title, contributions):
-        """格式化输出贡献数据"""
-        self.printer(f"{title}:")
+        """Format and log contribution data."""
+        logger.debug("%s:", title)
         for model_name, contribution in contributions.items():
-            self.printer(f"  {model_name}: {np.mean(contribution, axis=0)}")
+            logger.debug("  %s: %s", model_name, np.mean(contribution, axis=0))
 
     def _convert_to_numpy(self, tensor):
         """将张量转换为numpy数组"""
@@ -809,7 +804,7 @@ class ContributionMinor2_(Observer):
 #             'Var' : {}
 #         }
 
-#         self.printer = printer
+#         
 
 #     # ===== 主功能方法 =====
 #     def update(self, **kwargs):
@@ -969,11 +964,11 @@ class ContributionMinor2(Observer):
     使用分批均值和方差计算整体方差的方式。
     """
 
-    def __init__(self, printer=print):
+    def __init__(self):
         self.prob_summary_stats = [
             {'sample_number': 0, 'Mean': {}, 'Var': {}} for _ in range(4)
         ]
-        self.printer = printer
+        
 
     # ===== 主功能方法 =====
     def update(self, **kwargs):
@@ -1037,7 +1032,7 @@ class ContributionMinor2(Observer):
         """输出每个子模型的贡献信息"""
         for idx, prob_summary in enumerate(self.prob_summary_stats):
             if prob_summary['sample_number'] == 0:
-                self.printer(f"No contributions recorded in prob{idx}.")
+                logger.debug("No contributions recorded in prob%d.", idx)
                 continue
             self._print_contribution(f"Mean absolute contribution for prob{idx}", prob_summary['Mean'])
             self._print_contribution(f"Variance of contribution for prob{idx}", prob_summary['Var'])
@@ -1061,7 +1056,7 @@ class ContributionMinor2(Observer):
         for model_name, value in contributions.items():
             value = '\t'.join([str(x) for x in value])
             line = title + f"  ({model_name}): {value}"
-            self.printer(line)
+            logger.debug(line)
             #self.printer(f"  {model_name}: {value}")
 
     def _convert_to_numpy(self, tensor):
