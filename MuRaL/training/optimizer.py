@@ -1,5 +1,8 @@
+import logging
 import torch
 import sys
+
+logger = logging.getLogger('mural')
 
 def construct_params(model, learning_rates):
     """Helper function to construct parameter groups with learning rates."""

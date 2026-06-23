@@ -1,13 +1,11 @@
 import logging
-import time
 import numpy as np
-import sys
 import torch
 
 logger = logging.getLogger('mural')
 from MuRaL.evaluation.gradient_utils import print_gradients, print_gradient_norms
 
-from typing import Dict, Any, Union
+from typing import Dict
 
 
 
@@ -17,13 +15,13 @@ class Observer:
 
 
 class TimeMinor(Observer):
-    def __init__(self, out_after_n_batch, dataset_clss='Training'):
+    def __init__(self, out_after_n_batch, dataset_class='Training'):
         self.batch_load_times = []
         self.batch_train_times = []
         self.batch_total_times = []
-        self.conter = 0
+        self.counter = 0
         self.out_after_n_batch = out_after_n_batch
-        self.dataset_clss = dataset_clss
+        self.dataset_class = dataset_class
     
     def record_batch_load(self, time):
         self.batch_load_times.append(time)
@@ -35,13 +33,13 @@ class TimeMinor(Observer):
         self.batch_total_times.append(time)
 
     def out_batch_times(self):
-        logger.debug("%s load %d batch used %.2f min", self.dataset_clss, self.out_after_n_batch, np.sum(self.batch_load_times) / 60)
-        logger.debug("%s train %d batch used %.2f min", self.dataset_clss, self.out_after_n_batch, np.sum(self.batch_train_times) / 60)
-        logger.debug("%s after %d batch used %.2f min", self.dataset_clss, self.out_after_n_batch, np.sum(self.batch_total_times) / 60)
+        logger.debug("%s load %d batch used %.2f min", self.dataset_class, self.out_after_n_batch, np.sum(self.batch_load_times) / 60)
+        logger.debug("%s train %d batch used %.2f min", self.dataset_class, self.out_after_n_batch, np.sum(self.batch_train_times) / 60)
+        logger.debug("%s after %d batch used %.2f min", self.dataset_class, self.out_after_n_batch, np.sum(self.batch_total_times) / 60)
         self.reset()
 
     def reset(self):
-        self.conter = 0
+        self.counter = 0
         self.batch_load_times = []
         self.batch_train_times = []
         self.batch_total_times = []
@@ -61,13 +59,12 @@ class TimeMinor(Observer):
             counter = True
 
         if counter:
-            self.conter += 1
-            if self.conter == self.out_after_n_batch:
+            self.counter += 1
+            if self.counter == self.out_after_n_batch:
                 self.out_batch_times()
 
 class GradMinor(Observer):
     def __init__(self, out_after_n_batch, first_epoch=True):
-        self.grad_norms = []
         self.counter = 0
         self.out_after_n_batch = out_after_n_batch
         if first_epoch:
@@ -234,23 +231,9 @@ class PredsRecoder(Observer):
             self.preds = torch.cat([self.preds, preds], dim=0)
         
     def extract_preds(self, preds):
-        # Segment soft label strategy
-        if isinstance(preds, dict):
-            return preds['out']
-        elif isinstance(preds[0], dict):
-            predict_out = preds[0]
-            pred = predict_out['out']
-        else:
-            if isinstance(preds, tuple):
-                if len(preds) == 3:
-                    preds_local, preds_distal, pred = preds
-                if len(preds) == 4:
-                    preds_local, preds_mid, preds_distal, pred = preds
-                if len(preds) == 5:
-                    preds_local, preds_mid, preds_distal, pred, loss_construct = preds
-
-
-        return pred
+        if isinstance(preds, tuple):
+            return preds[0]['out']
+        return preds['out']
 
     
     def output(self):
@@ -286,8 +269,7 @@ class MuRRecoder(Observer):
         mu = predict_out.get('mu')
         r = predict_out.get('r')
         if mu is None:
-            return  # CE 模型没有 mu/r，静默跳过
-        batch_size = mu.shape[0]
+            return
         self.mu = mu if self.mu is None else torch.cat([self.mu, mu], dim=0)
         self.r = r if self.r is None else torch.cat([self.r, r], dim=0)
 
@@ -459,504 +441,34 @@ class SubModelPredResRecoder(Observer):
             else:
                 self.model_results[model_name] = torch.cat([self.model_results[model_name], preds], dim=0)
 
-    # ===== 数据提取方法 =====
-    def _extract_sub_model_preds(self, preds: Union[Dict, tuple]) -> Dict[str, torch.Tensor]:
-        """提取子模型预测"""
-        if isinstance(preds[0], dict):
-            return {k: v for k, v in preds[0].items() if v is not None}
-        elif isinstance(preds, tuple):
-            return self._extract_from_tuple(preds)
-        raise ValueError(f"Unsupported format for predictions: {type(preds)}")
-
-    def _extract_from_tuple(self, preds: tuple) -> Dict[str, torch.Tensor]:
-        """处理元组格式的子模型预测"""
-        length_map = {
-            3: ('local', 'distal', 'out'),
-            4: ('local', 'mid', 'distal', 'out'),
-            5: ('local', 'mid', 'distal', 'out', '_')
-        }
-        if len(preds) not in length_map:
-            raise ValueError(f"Unsupported tuple format for sub-model predictions: {len(preds)}")
-        return {name: preds[i] for i, name in enumerate(length_map[len(preds)]) if name != '_'}
+    def _extract_sub_model_preds(self, preds):
+        return _extract_model_components(preds)
 
 
 
-class ContributionMinor(Observer):
-    def __init__(self):
-        self.mean_contributions = None
-        self.calc_var_contributions = None
 
-    def record(self, preds_each_model: dict):
+# ---- shared helper --------------------------------------------------
 
-        mean_contributions = self.calc_mean_contribution(preds_each_model)
-        var_contributions = self.calc_var_contribution(preds_each_model)
+def _extract_model_components(preds):
+    """Normalise model output to {component_name: Tensor} dict.
 
-        if self.mean_contributions is None:
-            self.mean_contributions = mean_contributions
-            self.var_contributions = var_contributions
-        else:
-            self.update_contributions('mean_contribution', mean_contributions)
-            self.update_contributions('var_contribution', var_contributions)
-    
-    def calc_mean_contribution(self, preds_each_model: dict):
-        mean_contributions = {}
-        fused_preds = self.convert_to_numpy(preds_each_model['fused_pred'])
-        # Note: each model output should after softmax or sigmoid to ensure each element large than 0
-        for model_name, preds in preds_each_model.items():
-            if model_name == 'fused_pred':
-                continue
-            preds = self.convert_to_numpy(preds)
-            #contribution = np.mean(preds / fused_preds, axis=0)
-            contribution = np.mean(preds, axis=0)
-            mean_contributions[model_name] = [contribution]
-        return mean_contributions
-
-    def calc_var_contribution(self, preds_each_model: dict):
-        var_contributions = {}
-
-        for model_name, preds in preds_each_model.items():
-            if model_name == 'fused_pred':
-                continue
-            preds = self.convert_to_numpy(preds)
-            contribution = np.var(preds, axis=0)
-            var_contributions[model_name] = [contribution]
-        return var_contributions 
-    
-    def update_contributions(self, contribution_name , contributions):
-
-        if contribution_name == 'mean_contribution':
-            for model_name, contribution in contributions.items():
-                self.mean_contributions[model_name] = np.concatenate([self.mean_contributions[model_name], contributions[model_name]])
-
-        elif contribution_name == 'var_contribution':
-            for model_name, contribution in contributions.items():
-                self.var_contributions[model_name] = np.concatenate([self.var_contributions[model_name], contributions[model_name]])
-        else:
-            raise ValueError("Error: For ContributionMinor, contribution_name must be 'mean_contribution' or 'var_contribution'")
-    
-    def convert_to_numpy(self, contribution):
-        if contribution.is_cuda:
-            contribution = contribution.cpu().numpy()
-        else:
-            contribution = contribution.numpy()
-        return contribution
-    
-    def extract_sub_model_preds(self, preds):
-        if isinstance(preds[0], dict):
-            preds = preds[0]
-            if preds.get('local2') is not None:
-                if preds.get('local3') is None:
-                    return {
-                        'local': preds['local'],
-                        'local2': preds['local2'],
-                        'mid': preds['mid'],
-                        'distal': preds['distal'],
-                        'fused_pred': preds['out']
-                    }
-                else:
-                    return {
-                        'local': preds['local'],
-                        'local2': preds['local2'],
-                        'local3': preds['local3'],
-                        'mid': preds['mid'],
-                        'distal': preds['distal'],
-                        'fused_pred': preds['out']
-                    }
-            
-            return {
-                'local': preds['local'],
-                'mid': preds['mid'],
-                'distal': preds['distal'],
-                'fused_pred': preds['out']
-            }
- 
-        
-        if isinstance(preds, tuple):
-            if len(preds) == 3:
-                preds_local, preds_distal, pred = preds
-                return {
-                    'local': preds_local,
-                    'distal': preds_distal,
-                    'fused_pred': pred
-                }
-            if len(preds) == 4:
-                preds_local, preds_mid, preds_distal, pred = preds
-
-            if len(preds) == 5:
-                preds_local, preds_mid, preds_distal, pred, loss_construct = preds
-
-            return {
-                    'local': preds_local,
-                    'mid': preds_mid,
-                    'distal': preds_distal,
-                    'fused_pred': pred
-                }
-
-        return None
-
-    def reset(self):
-        self.mean_contributions = None
-        self.var_contributions = None
-    
-    def out_contribution(self):
-        if self.mean_contributions is None:
-            logger.debug("Only one preds out, No contribution to report.")
-            return
-
-        for model_name, contribution in self.mean_contributions.items():
-            logger.debug("%s Mean abs contribution: %s", model_name, np.mean(contribution, axis=0))
-
-        for model_name, contribution in self.var_contributions.items():
-            logger.debug("%s Mean Var: %s", model_name, np.mean(contribution, axis=0))
-
-    def update(self, **kwargs):
-        if 'valid_preds' in kwargs:
-            preds = kwargs['valid_preds']
-            preds_each_model = self.extract_sub_model_preds(preds)
-            if preds_each_model is not None:
-                self.record(preds_each_model)
-
-        if 'valid_step_finish' in kwargs:
-            self.out_contribution()
-            self.reset()
-
-class ContributionMinor2_(Observer):
+    Works with both the normalised (PredictOutput, Optional[SegmentOutput])
+    format and legacy dict/tuple formats.
     """
-    1. optimi according to ContributionMinor
-    2. change contribution save method
-        |--- record contribution for each mut type
-        |--- fix bug for Var contribution
-    """
+    # normalised format: (PredictOutput, Optional[SegmentOutput])
+    if isinstance(preds, tuple) and hasattr(preds[0], 'items'):
+        return {k: v for k, v in preds[0].items() if v is not None}
+    # legacy dict-in-tuple / PredictOutput-in-tuple
+    if isinstance(preds, tuple) and len(preds) >= 1 and hasattr(preds[0], 'items'):
+        return {k: v for k, v in preds[0].items() if v is not None}
+    # legacy positional tuple: (local, distal, fused) or (local, mid, distal, fused)
+    if isinstance(preds, tuple) and len(preds) >= 3:
+        names = {3: ('local', 'distal', 'fused_pred'),
+                 4: ('local', 'mid', 'distal', 'fused_pred'),
+                 5: ('local', 'mid', 'distal', 'fused_pred', '_')}
+        return dict(zip(names.get(len(preds), ()), preds))
+    return None
 
-    def __init__(self, printer=print):
-        self.mean_contributions = None
-        self.var_contributions = None
-        
-
-    # ===== 主功能方法 =====
-    def update(self, **kwargs):
-        """Observer接口实现, 响应模型训练或验证事件"""
-        if 'valid_preds' in kwargs:
-            mut_labels = self.extract_mut_labels(kwargs['label'])
-            mut_labels = mut_labels.view(-1)
-            preds_each_model = self.extract_sub_model_preds(kwargs['valid_preds'])
-            if preds_each_model:
-                self.record(preds_each_model, mut_labels)
-
-        if 'valid_step_finish' in kwargs:
-            self.report_contributions()
-            self.reset()
-
-    # ===== 核心逻辑 =====
-    def record(self, preds_each_model: dict, mut_labels: torch.Tensor):
-        """记录每轮验证子模型贡献"""
-        mean_contributions = self._calc_contribution(preds_each_model, mut_labels, method="mean")
-        var_contributions = self._calc_contribution(preds_each_model, mut_labels, method="var")
-
-        # 初始化或更新贡献数据
-        if self.mean_contributions is None:
-            self.mean_contributions = mean_contributions
-            self.var_contributions = var_contributions
-        else:
-            self._update_contributions(self.mean_contributions, mean_contributions)
-            self._update_contributions(self.var_contributions, var_contributions)
-
-    def report_contributions(self):
-        """输出每个子模型的贡献信息"""
-        if self.mean_contributions is None:
-            self.printer("No contributions recorded yet.")
-            return
-
-        self._print_contribution("Mean absolute contribution", self.mean_contributions)
-        self._print_contribution("Variance of contribution", self.var_contributions)
-
-    def reset(self):
-        """重置贡献数据"""
-        self.mean_contributions = None
-        self.var_contributions = None
-
-    # ===== 私有工具方法 =====
-    def _calc_contribution(self, preds_each_model: dict, mut_labels:torch.tensor , method: str):
-        """计算子模型的贡献，支持均值或方差"""
-        contributions = {}
-        mut_labels = self._convert_to_numpy(mut_labels)
-
-        for model_name, preds in preds_each_model.items():
-            if model_name == 'fused_pred':
-                continue
-        
-            preds = self._convert_to_numpy(preds)
-        
-            # 获取类别数和初始化贡献矩阵
-            num_classes = 4
-            contribution_matrix = np.zeros((num_classes, preds.shape[1]))
-        
-            for label in range(num_classes):
-                # 获取当前类别的预测
-                class_preds = preds[mut_labels == label]
-                if class_preds.shape[0] > 0:  # 如果存在该类别的数据
-                    if method == "mean":
-                        contribution_matrix[label] = np.mean(class_preds, axis=0)
-                    elif method == "var":
-                        contribution_matrix[label] = np.var(class_preds, axis=0)
-                    else:
-                        raise ValueError("Unsupported method for contribution calculation.")
-
-            contributions[model_name] = [contribution_matrix]
-    
-        return contributions
-
-    def _calc_batch_stats(self, preds, mut_labels, num_classes):
-        """计算当前批次的均值、方差和样本计数"""
-        preds = self._convert_to_numpy(preds)
-        mut_labels = self._convert_to_numpy(mut_labels)
-        num_features = preds.shape[1]
-
-        batch_mean = np.zeros((num_classes, num_features))
-        batch_var = np.zeros((num_classes, num_features))
-        batch_counts = np.zeros(num_classes)
-
-        for label in range(num_classes):
-            class_preds = preds[mut_labels == label]
-            if class_preds.shape[0] > 0:
-                batch_mean[label] = np.mean(class_preds, axis=0)
-                batch_var[label] = np.var(class_preds, axis=0)
-                batch_counts[label] = class_preds.shape[0]
-
-        return batch_mean, batch_var, batch_counts
-
-    def _update_contributions(self, existing, new):
-        """更新现有的贡献数据"""
-        for model_name, contribution in new.items():
-            existing[model_name] = np.concatenate([existing[model_name], contribution],axis=0)
-
-    def _print_contribution(self, title, contributions):
-        """Format and log contribution data."""
-        logger.debug("%s:", title)
-        for model_name, contribution in contributions.items():
-            logger.debug("  %s: %s", model_name, np.mean(contribution, axis=0))
-
-    def _convert_to_numpy(self, tensor):
-        """将张量转换为numpy数组"""
-        if hasattr(tensor, 'is_cuda') and tensor.is_cuda:
-            return tensor.cpu().numpy()
-        return tensor.numpy()
-
-    # ===== 数据提取方法 =====
-    def extract_mut_labels(self, label):
-        """从标签数据中提取突变标签"""
-        if isinstance(label, dict):
-            return label['label']
-        return label
-    def extract_sub_model_preds(self, preds):
-        """根据数据格式提取子模型预测"""
-        if isinstance(preds[0], dict):
-            return {k: v for k, v in preds[0].items() if v is not None}
-        if isinstance(preds, tuple):
-            return self._extract_from_tuple(preds)
-        return None
-
-    def _extract_from_dict(self, preds):
-        """处理字典格式的子模型预测"""
-        keys = ['local', 'local2', 'local3', 'mid', 'distal', 'out']
-        available_keys = {k: preds[k] for k in keys if preds[k] is not None}
-        available_keys['fused_pred'] = available_keys.pop('out', None)
-        return available_keys
-
-    def _extract_from_tuple(self, preds):
-        """处理元组格式的子模型预测"""
-        if len(preds) == 3:
-            preds_local, preds_distal, pred = preds
-            return {'local': preds_local, 'distal': preds_distal, 'fused_pred': pred}
-        if len(preds) == 4:
-            preds_local, preds_mid, preds_distal, pred = preds
-        elif len(preds) == 5:
-            preds_local, preds_mid, preds_distal, pred, _ = preds
-        else:
-            raise ValueError("Unsupported tuple format for sub-model predictions.")
-        return {'local': preds_local, 'mid': preds_mid, 'distal': preds_distal, 'fused_pred': pred}
-
-# class ContributionMinor2(Observer):
-#     """
-#     优化代码以支持批次累积计算贡献。
-#     使用分批均值和方差计算整体方差的方式。
-#     """
-
-#     def __init__(self, printer=print):
-#         self.prob0_sumary_stats = {
-#             'sample_number' : 0,
-#             'Mean': {},
-#             'Var' : {}
-#         }
-#         self.prob1_sumary_stats = {
-#             'sample_number' : 0,
-#             'Mean': {},
-#             'Var' : {}
-#         }
-#         self.prob2_sumary_stats = {
-#             'sample_number' : 0,
-#             'Mean': {},
-#             'Var' : {}
-#         }
-#         self.prob3_sumary_stats = {
-#             'sample_number' : 0,
-#             'Mean': {},
-#             'Var' : {}
-#         }
-
-#         
-
-#     # ===== 主功能方法 =====
-#     def update(self, **kwargs):
-#         """Observer接口实现, 响应模型训练或验证事件"""
-#         if 'valid_preds' in kwargs:
-#             mut_labels = self.extract_mut_labels(kwargs['label'])
-#             mut_labels = mut_labels.view(-1)
-#             preds_each_model = self.extract_sub_model_preds(kwargs['valid_preds'])
-#             if preds_each_model:
-#                 self.record(preds_each_model, mut_labels)
-
-#         if 'valid_step_finish' in kwargs:
-#             self.report_contributions()
-#             self.reset()
-
-#     # ===== 核心逻辑 =====
-#     def record(self, preds_each_model: dict, mut_labels: torch.Tensor):
-#         """记录每轮验证子模型贡献"""
-#         num_classes = 4
-#         for group in range(num_classes):
-#             mut_labels_group_idx = (mut_labels == group)
-#             sample_number = np.sum(mut_labels_group_idx)
-#             if sample_number == 0:
-#                 continue
-        
-#             prob_sumary_stats = self.choice_prob_sumary_stats(group)
-#             if prob_sumary_stats['sample_number'] == 0:
-#                 prob_sumary_stats['sample_number'] = sample_number
-
-#             for model_name, preds in preds_each_model.items():
-#                 if model_name == 'fused_pred':
-#                     continue
-#                 preds_one_type = preds[mut_labels_group_idx]
-#                 batch_mean, batch_var = self._calc_batch_stats(preds_one_type) 
-
-#                 if model_name not in prob_sumary_stats['Mean']:
-#                     prob_sumary_stats['Mean'][model_name] = batch_mean
-#                     prob_sumary_stats['Var'][model_name] = batch_var
-
-#                 # 更新均值、方差、样本数量
-#                 self._update_contributions(
-#                     model_name,
-#                     batch_mean=batch_mean,
-#                     batch_var=batch_var,
-#                     batch_counts=sample_number,
-#                     prob_sumary_stats=prob_sumary_stats
-#                 )
-
-#             prob_sumary_stats['sample_number'] += sample_number
-
-#     def choice_prob_sumary_stats(self, group):
-#         if group == 0:
-#             return self.prob0_sumary_stats
-#         elif group == 1:
-#             return self.prob1_sumary_stats
-#         elif group == 2:
-#             return self.prob2_sumary_stats
-#         elif group == 3:
-#             return self.prob3_sumary_stats
-#         else:
-#             raise ValueError("Error: Unsupported group number for choice_prob_sumary_stats")
-
-#     def report_contributions(self):
-#         """输出每个子模型的贡献信息"""
-#         for idx, prob_sumary_stats in enumerate([self.prob0_sumary_stats, self.prob1_sumary_stats, self.prob2_sumary_stats, self.prob3_sumary_stats]):
-#             if prob_sumary_stats['sample_number'] == 0:
-#                 self.printer(f"No contributions recorded in prob{idx}_sumary_stats.")
-#                 continue
-#             self._print_contribution(f"Mean absolute contribution for prob{idx}", prob_sumary_stats['Mean'])
-#             self._print_contribution(f"Variance of contribution for prob{idx}", prob_sumary_stats['Var'])
-
-#     def reset(self):
-#         """重置贡献数据"""
-#         self.mean_contributions = {}
-#         self.var_contributions = {}
-#         self.batch_sizes = {}
-
-#     # ===== 私有工具方法 =====
-#     def _calc_batch_stats(self, preds):
-#         """计算当前批次的均值、方差和样本计数"""
-#         preds = self._convert_to_numpy(preds)
-#         batch_mean = np.mean(class_preds, axis=0)
-#         batch_var = np.var(class_preds, axis=0)
-#         return batch_mean, batch_var
-
-#     def _update_specify_model_contributions(self, model_name, batch_mean, batch_var, batch_counts, prob_sumary_stats):
-#         """累积更新均值和方差"""
-#         existing_mean = prob_sumary_stats['Mean'][model_name]
-#         existing_var = prob_sumary_stats['Var'][model_name]
-#         existing_counts = prob_sumary_stats['sample_number']
-
-#         total_counts = existing_counts + batch_counts
-#         mean_diff = batch_mean - existing_mean
-
-#         # 更新均值
-#         prob_sumary_stats['Mean'][model_name] = (
-#             existing_mean + (batch_counts / total_counts) * mean_diff
-#         )
-
-#         # 更新方差
-#         prob_sumary_stats['Var'][model_name] = (
-#             (existing_counts * (existing_var + mean_diff**2) +
-#              batch_counts * (batch_var + mean_diff**2)) / total_counts
-#         )
-
-
-#     def _print_contribution(self, title, contributions):
-#         """格式化输出贡献数据"""
-#         self.printer(f"{title}:")
-#         for model_name, contribution in contributions.items():
-#             self.printer(f"  {model_name}: {contribution}")
-
-#     def _convert_to_numpy(self, tensor):
-#         """将张量转换为numpy数组"""
-#         if hasattr(tensor, 'is_cuda') and tensor.is_cuda:
-#             return tensor.cpu().numpy()
-#         return tensor.numpy()
-
-#     # ===== 数据提取方法 =====
-#     def extract_mut_labels(self, label):
-#         """从标签数据中提取突变标签"""
-#         if isinstance(label, dict):
-#             return label['label']
-#         return label
-
-#     def extract_sub_model_preds(self, preds):
-#         """根据数据格式提取子模型预测"""
-#         if isinstance(preds[0], dict):
-#             return self._extract_from_dict(preds[0])
-#         if isinstance(preds, tuple):
-#             return self._extract_from_tuple(preds)
-#         return None
-
-#     def _extract_from_dict(self, preds):
-#         """处理字典格式的子模型预测"""
-#         keys = ['local', 'local2', 'local3', 'mid', 'distal', 'out']
-#         available_keys = {k: preds[k] for k in keys if preds.get(k) is not None}
-#         available_keys['fused_pred'] = available_keys.pop('out', None)
-#         return available_keys
-
-#     def _extract_from_tuple(self, preds):
-#         """处理元组格式的子模型预测"""
-#         if len(preds) == 3:
-#             preds_local, preds_distal, pred = preds
-#             return {'local': preds_local, 'distal': preds_distal, 'fused_pred': pred}
-#         if len(preds) == 4:
-#             preds_local, preds_mid, preds_distal, pred = preds
-#         elif len(preds) == 5:
-#             preds_local, preds_mid, preds_distal, pred, _ = preds
-#         else:
-#             raise ValueError("Unsupported tuple format for sub-model predictions.")
-#         return {'local': preds_local, 'mid': preds_mid, 'distal': preds_distal, 'fused_pred': pred}
 
 class ContributionMinor2(Observer):
     """
@@ -1071,23 +583,7 @@ class ContributionMinor2(Observer):
         return label['label'] if isinstance(label, dict) else label
 
     def _extract_sub_model_preds(self, preds):
-        """提取子模型预测"""
-        if isinstance(preds[0], dict):
-            return {k: v for k, v in preds[0].items() if v is not None}
-        if isinstance(preds, tuple):
-            return self._extract_from_tuple(preds)
-        return None
-
-    def _extract_from_tuple(self, preds):
-        """处理元组格式的子模型预测"""
-        length_map = {
-            3: ('local', 'distal', 'fused_pred'),
-            4: ('local', 'mid', 'distal', 'fused_pred'),
-            5: ('local', 'mid', 'distal', 'fused_pred', '_')
-        }
-        if len(preds) in length_map:
-            return dict(zip(length_map[len(preds)], preds))
-        raise ValueError("Unsupported tuple format for sub-model predictions.")
+        return _extract_model_components(preds)
 
 
 class GammaTotalDirichletRecoder(Observer):

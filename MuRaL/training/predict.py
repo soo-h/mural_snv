@@ -5,14 +5,14 @@ import time
 logger = logging.getLogger('mural')
 
 import torch.nn.functional as F
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, SubModelPredResRecoder, ContributionMinor2, DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, SubModelPredResRecoder, ContributionMinor2, DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder
 from MuRaL.training.train import TrainerSubject, get_inputs_labels, model_train_register
 
 
 
 
 class Predictor(TrainerSubject):
-    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, detach=False, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False, collect_gamma_total_dirichlet=False) -> None:
+    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False, collect_gamma_total_dirichlet=False) -> None:
 
         super().__init__()
 
@@ -22,7 +22,6 @@ class Predictor(TrainerSubject):
         self.config = config
         self.LossCalculator = loss_calculator
         self.train_strategy = train_strategy
-        self.detach = detach
         self.collect_mu_r = collect_mu_r
         self.collect_evidence = collect_evidence
         self.collect_gamma_mdn = collect_gamma_mdn
@@ -68,7 +67,7 @@ class Predictor(TrainerSubject):
             for batch in dataloader_test:
                 batch = self.load_to_device(batch, self.device)
                 label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
-                valid_preds = model_predict(inputs, self.model, self.detach, self.train_strategy)
+                valid_preds = model_predict(inputs, self.model, self.train_strategy)
                 #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
                 losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
                 #valid_pred = self.LossCalculator.extract_pred(valid_preds)
@@ -105,7 +104,7 @@ class Predictor(TrainerSubject):
             for batch in dataloader_test:
                 batch = self.load_to_device(batch, self.device)
                 label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
-                valid_preds = model_predict(inputs, self.model, self.detach, self.train_strategy)
+                valid_preds = model_predict(inputs, self.model, self.train_strategy)
                 #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
                 losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
                 #valid_pred = self.LossCalculator.extract_pred(valid_preds)
@@ -200,18 +199,14 @@ class Predictor(TrainerSubject):
             return self._gamma_total_dirichlet_recoder.get_components()
         return None, None, None, None
 
-def model_predict(batch, model, detach, strategy):
+def model_predict(batch, model, strategy):
     from MuRaL.training.train import normalize_output
-    if detach:
-        cont_x, cat_x, distal_x = batch
-        raw = model.predict((cont_x, cat_x), distal_x)
-    else:
-        model_train = model_train_register(strategy)
-        raw = model_train(batch, model)
+    model_train = model_train_register(strategy)
+    raw = model_train(batch, model)
     return normalize_output(raw)
 
 class BayesianPredictor(TrainerSubject):
-    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, detach=False) -> None:
+    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None) -> None:
 
         super().__init__()
 
@@ -221,7 +216,6 @@ class BayesianPredictor(TrainerSubject):
         self.config = config
         self.LossCalculator = loss_calculator
         self.train_strategy = train_strategy
-        self.detach = detach
         self.num_monte_carlo = self.config.get('num_monte_carlo', 10)
         self.model_predict = model_train_register(self.train_strategy)
 
@@ -305,8 +299,8 @@ class BayesianPredictor(TrainerSubject):
         
     def _extract_final_pred(self, preds):
         preds = preds[0] if len(preds) == 2 else preds
-        if isinstance(preds, dict):
+        if hasattr(preds, 'get'):
             return preds['out']
         else:
-            assert isinstance(preds, torch.Tensor) , "preds must be a torch.Tensor or a dict with key 'out'"
+            assert isinstance(preds, torch.Tensor), "preds must be a torch.Tensor or dict-like with key 'out'"
             return preds

@@ -33,6 +33,7 @@ import time
 import datetime
 import random
 
+from MuRaL.utils.printer_utils import get_printer
 from MuRaL.utils.gpu_utils import get_available_gpu, check_cuda_id
 from MuRaL.models.nn_models import *
 from MuRaL.models.nn_utils import *
@@ -447,6 +448,12 @@ def parse_arguments(parser):
                           """).strip()
                           )
     
+    optional.add_argument('--debug', default=False, action='store_true',
+                          help=textwrap.dedent("""
+                          Enable debug logging (batch timing, gradient distribution,
+                          contribution analysis). Writes to training_debug.log.
+                          Default: False.""").strip())
+
     optional.add_argument('-v', '--version', action='version',
                         version='%(prog)s {}'.format(__version__))
     

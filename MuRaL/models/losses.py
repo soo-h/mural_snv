@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import sys
 import inspect
 
+from MuRaL.models.output import PredictOutput
 
 class NegativeBinomialLoss(nn.Module):
     """负二项分布负对数似然损失。
@@ -122,15 +123,18 @@ class DirichletMDNClassificationLoss(nn.Module):
 
     @staticmethod
     def _unpack_pred(pred):
-        if isinstance(pred, dict):
+        if isinstance(pred, (dict, PredictOutput)):
             return pred['pi_logits'], pred['alpha_raw']
         if isinstance(pred, (tuple, list)):
             if len(pred) != 2:
                 raise ValueError("Tuple pred should be (pi_logits, alpha_raw).")
+            p0 = pred[0]
+            if isinstance(p0, (dict, PredictOutput)):
+                return p0['pi_logits'], p0['alpha_raw']
             return pred[0], pred[1]
         raise TypeError(
-            "pred should be dict with keys ['pi_logits', 'alpha_raw'] "
-            "or tuple (pi_logits, alpha_raw)."
+            "pred should be dict-like with keys ['pi_logits', 'alpha_raw'] "
+            "or tuple containing one."
         )
 
 
@@ -187,15 +191,397 @@ class GammaMDNClassificationLoss(nn.Module):
 
     @staticmethod
     def _unpack_pred(pred):
-        if isinstance(pred, dict):
+        if isinstance(pred, (dict, PredictOutput)):
             return pred['pi_logits'], pred['alpha_raw'], pred['beta_raw']
         if isinstance(pred, (tuple, list)):
+            p0 = pred[0] if isinstance(pred[0], (dict, PredictOutput)) else pred
+            if isinstance(p0, (dict, PredictOutput)):
+                return p0['pi_logits'], p0['alpha_raw'], p0['beta_raw']
             if len(pred) != 3:
                 raise ValueError("Tuple pred should be (pi_logits, alpha_raw, beta_raw).")
             return pred[0], pred[1], pred[2]
         raise TypeError(
-            "pred should be dict with keys ['pi_logits', 'alpha_raw', 'beta_raw'] "
-            "or tuple (pi_logits, alpha_raw, beta_raw)."
+            "pred should be dict-like with keys ['pi_logits', 'alpha_raw', 'beta_raw'] "
+            "or tuple containing one."
+        )
+
+
+class PoissonGammaMDNClassificationLoss(nn.Module):
+    """Poisson-Gamma MDN classification loss.
+
+    Model outputs raw pi_logits, alpha_raw (K,3), beta_raw (K,3).
+    Loss derives p(class=0) from Poisson process:
+      P(no mutation) = exp(-sum_i λ_i)  where λ_i = α_i / β_i
+    """
+
+    def __init__(
+        self,
+        eps: float = 1e-8,
+        reduction: str = 'sum',
+    ):
+        super().__init__()
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, pred, y):
+        pi_logits, alpha_raw, beta_raw = self._unpack_pred(pred)
+        B, K, C_mut = alpha_raw.shape  # C_mut = 3
+
+        log_pi = F.log_softmax(pi_logits, dim=1)                    # (B, K)
+
+        alpha = F.softplus(alpha_raw) + self.eps                     # (B, K, 3)
+        beta = F.softplus(beta_raw) + self.eps                       # (B, K, 3)
+        lam = alpha / beta                                           # (B, K, 3)
+        lam_total = lam.sum(dim=-1)                                  # (B, K)
+
+        # --- log p_k(0) = -λ_total ---
+        log_p_k0 = -lam_total                                        # (B, K)
+
+        # --- log p_k(i) for i=1,2,3 ---
+        # log(1 - exp(-λ)) + log(λ_i) - log(λ_total)
+        log_1mexp = torch.log(-torch.expm1(-lam_total) + self.eps)   # (B, K)
+        log_p_ki = (
+            log_1mexp.unsqueeze(-1)
+            + torch.log(lam + self.eps)
+            - torch.log(lam_total.unsqueeze(-1) + self.eps)
+        )                                                            # (B, K, 3)
+
+        log_p_k = torch.cat([log_p_k0.unsqueeze(-1), log_p_ki], dim=-1)  # (B, K, 4)
+
+        # --- log p(y) via logsumexp ---
+        y_idx = y.view(B, 1, 1).expand(B, K, 1)
+        log_p_y = log_p_k.gather(dim=2, index=y_idx).squeeze(2)      # (B, K)
+        log_likelihood = torch.logsumexp(log_pi + log_p_y, dim=1)    # (B,)
+        nll_loss = -log_likelihood
+
+        if self.reduction == 'mean':
+            nll_loss = nll_loss.mean()
+        elif self.reduction == 'sum':
+            nll_loss = nll_loss.sum()
+        elif self.reduction != 'none':
+            raise ValueError(f"Unknown reduction: {self.reduction}")
+
+        return nll_loss
+
+    @staticmethod
+    def _unpack_pred(pred):
+        if isinstance(pred, (dict, PredictOutput)):
+            return pred['pi_logits'], pred['alpha_raw'], pred['beta_raw']
+        if isinstance(pred, (tuple, list)):
+            p0 = pred[0] if isinstance(pred[0], (dict, PredictOutput)) else pred
+            if isinstance(p0, (dict, PredictOutput)):
+                return p0['pi_logits'], p0['alpha_raw'], p0['beta_raw']
+            if len(pred) != 3:
+                raise ValueError("Tuple pred should be (pi_logits, alpha_raw, beta_raw).")
+            return pred[0], pred[1], pred[2]
+        raise TypeError(
+            "pred should be dict-like with keys ['pi_logits', 'alpha_raw', 'beta_raw'] "
+            "or tuple containing one."
+        )
+
+
+class PoissonGammaLogClassificationLoss(nn.Module):
+    """Poisson-Gamma MDN loss with log-parameterized Gamma distribution.
+
+    Model outputs raw pi_logits, alpha_raw (log-space), beta_raw (log-space).
+    Activation uses clamp + exp instead of softplus.
+    """
+
+    def __init__(
+        self,
+        eps=1e-8,
+        reduction='sum',
+        alpha_min=0.05,
+        beta_min=1e-3,
+        log_alpha_min=-10.0,
+        log_alpha_max=8.0,
+        log_beta_min=-10.0,
+        log_beta_max=8.0,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.reduction = reduction
+        self.alpha_min = alpha_min
+        self.beta_min = beta_min
+        self.log_alpha_min = log_alpha_min
+        self.log_alpha_max = log_alpha_max
+        self.log_beta_min = log_beta_min
+        self.log_beta_max = log_beta_max
+
+    def forward(self, pred, y):
+        from MuRaL.models.gamma_mdn_model import activate_gamma_alpha_beta
+
+        pi_logits, alpha_raw, beta_raw = self._unpack_pred(pred)
+        B, K, C_mut = alpha_raw.shape  # C_mut = 3
+
+        log_pi = F.log_softmax(pi_logits, dim=1)                    # (B, K)
+
+        alpha, beta = activate_gamma_alpha_beta(
+            alpha_raw, beta_raw,
+            eps=self.eps,
+            alpha_min=self.alpha_min,
+            beta_min=self.beta_min,
+            log_alpha_min=self.log_alpha_min,
+            log_alpha_max=self.log_alpha_max,
+            log_beta_min=self.log_beta_min,
+            log_beta_max=self.log_beta_max,
+        )
+
+        lam = alpha / beta                                           # (B, K, 3)
+        lam_total = lam.sum(dim=-1)                                  # (B, K)
+
+        log_p_k0 = -lam_total                                        # (B, K)
+        log_1mexp = torch.log(-torch.expm1(-lam_total) + self.eps)   # (B, K)
+        log_p_ki = (
+            log_1mexp.unsqueeze(-1)
+            + torch.log(lam + self.eps)
+            - torch.log(lam_total.unsqueeze(-1) + self.eps)
+        )                                                            # (B, K, 3)
+
+        log_p_k = torch.cat([log_p_k0.unsqueeze(-1), log_p_ki], dim=-1)  # (B, K, 4)
+
+        y_idx = y.view(B, 1, 1).expand(B, K, 1)
+        log_p_y = log_p_k.gather(dim=2, index=y_idx).squeeze(2)      # (B, K)
+        log_likelihood = torch.logsumexp(log_pi + log_p_y, dim=1)    # (B,)
+        nll_loss = -log_likelihood
+
+        if self.reduction == 'mean':
+            nll_loss = nll_loss.mean()
+        elif self.reduction == 'sum':
+            nll_loss = nll_loss.sum()
+        elif self.reduction != 'none':
+            raise ValueError(f"Unknown reduction: {self.reduction}")
+
+        return nll_loss
+
+    @staticmethod
+    def _unpack_pred(pred):
+        if isinstance(pred, (dict, PredictOutput)):
+            return pred['pi_logits'], pred['alpha_raw'], pred['beta_raw']
+        if isinstance(pred, (tuple, list)):
+            p0 = pred[0] if isinstance(pred[0], (dict, PredictOutput)) else pred
+            if isinstance(p0, (dict, PredictOutput)):
+                return p0['pi_logits'], p0['alpha_raw'], p0['beta_raw']
+            if len(pred) != 3:
+                raise ValueError("Tuple pred should be (pi_logits, alpha_raw, beta_raw).")
+            return pred[0], pred[1], pred[2]
+        raise TypeError(
+            "pred should be dict-like with keys ['pi_logits', 'alpha_raw', 'beta_raw'] "
+            "or tuple containing one."
+        )
+
+
+class PoissonExactClassificationLoss(nn.Module):
+    """Poisson-Gamma MDN loss with exact Gamma-Poisson marginal.
+
+    P(no mutation) = Π_i (β_i/(β_i+1))^α_i   (exact, not exp(-Σα/β)).
+
+    This depends on absolute α and β (not just α/β), which constrains
+    the parameter space and bounds gradients (∂L/∂α ∈ [-7, 0]).
+    """
+
+    def __init__(
+        self,
+        eps=1e-8,
+        reduction='sum',
+        alpha_min=0.05,
+        beta_min=1e-3,
+        log_alpha_min=-10.0,
+        log_alpha_max=8.0,
+        log_beta_min=-10.0,
+        log_beta_max=8.0,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.reduction = reduction
+        self.alpha_min = alpha_min
+        self.beta_min = beta_min
+        self.log_alpha_min = log_alpha_min
+        self.log_alpha_max = log_alpha_max
+        self.log_beta_min = log_beta_min
+        self.log_beta_max = log_beta_max
+
+    def forward(self, pred, y):
+        pi_logits, alpha_raw, beta_raw = self._unpack_pred(pred)
+        B, K, C_mut = alpha_raw.shape
+
+        log_pi = F.log_softmax(pi_logits, dim=1)                    # (B, K)
+
+        # Softplus 激活（梯度有界，无 exp 放大问题）
+        alpha = F.softplus(alpha_raw) + self.eps                     # (B, K, 3)
+        beta  = F.softplus(beta_raw) + self.eps                      # (B, K, 3)
+
+        # --- P(no mutation) = Π_i (β_i/(β_i+1))^α_i ---
+        log_beta_ratio = -torch.log1p(1.0 / (beta + self.eps))      # (B, K, 3)
+        log_p_k0 = (alpha * log_beta_ratio).sum(dim=-1)              # (B, K)
+
+        # --- P(mutation) = 1 - P(no mutation) ---
+        log_p_k_mut = torch.log((-torch.expm1(log_p_k0)).clamp_min(self.eps))
+
+        # --- subtype composition (Gamma mean approx) ---
+        log_lam = torch.log(alpha + self.eps) - torch.log(beta + self.eps)
+        log_q = log_lam - torch.logsumexp(log_lam, dim=-1, keepdim=True)
+        log_p_ki = log_p_k_mut.unsqueeze(-1) + log_q               # (B, K, 3)
+
+        log_p_k = torch.cat([log_p_k0.unsqueeze(-1), log_p_ki], dim=-1)  # (B, K, 4)
+
+        y_idx = y.view(B, 1, 1).expand(B, K, 1)
+        log_p_y = log_p_k.gather(dim=2, index=y_idx).squeeze(2)
+        log_likelihood = torch.logsumexp(log_pi + log_p_y, dim=1)
+        nll_loss = -log_likelihood
+
+        if self.reduction == 'mean':
+            nll_loss = nll_loss.mean()
+        elif self.reduction == 'sum':
+            nll_loss = nll_loss.sum()
+        elif self.reduction != 'none':
+            raise ValueError(f"Unknown reduction: {self.reduction}")
+
+        return nll_loss
+
+    @staticmethod
+    def _unpack_pred(pred):
+        if isinstance(pred, (dict, PredictOutput)):
+            return pred['pi_logits'], pred['alpha_raw'], pred['beta_raw']
+        if isinstance(pred, (tuple, list)):
+            p0 = pred[0] if isinstance(pred[0], (dict, PredictOutput)) else pred
+            if isinstance(p0, (dict, PredictOutput)):
+                return p0['pi_logits'], p0['alpha_raw'], p0['beta_raw']
+            if len(pred) != 3:
+                raise ValueError("Tuple should be (pi_logits, alpha_raw, beta_raw).")
+            return pred[0], pred[1], pred[2]
+        raise TypeError(
+            "pred should be dict-like or keys ['pi_logits', 'alpha_raw', 'beta_raw'] "
+            "or tuple containing one."
+        )
+
+
+class GammaTotalDirichletSubtypeLoss(nn.Module):
+    """Gamma-Total-Dirichlet MDN loss.
+
+    L = L_4class + w_mut * L_mut + w_type * L_type
+
+      L_4class: four-class NLL on final probability [non-mut, type1-3]
+      L_mut:    BCE on mutation status (y > 0)
+      L_type:   subtype CE only on mutation samples (y - 1 for y in {1,2,3})
+    """
+
+    def __init__(
+        self,
+        w_mut=0.2,
+        w_type=0.2,
+        eps=1e-8,
+        reduction='sum',
+        type_class_weight=None,
+    ):
+        super().__init__()
+        self.w_mut = w_mut
+        self.w_type = w_type
+        self.eps = eps
+        self.reduction = reduction
+
+        if type_class_weight is not None:
+            self.register_buffer(
+                "type_class_weight",
+                torch.as_tensor(type_class_weight, dtype=torch.float32),
+            )
+        else:
+            self.type_class_weight = None
+
+        # Accumulators for epoch-level sub-loss logging
+        self._reset_loss_accumulators()
+
+    def _reset_loss_accumulators(self):
+        self._acc_l4 = 0.0
+        self._acc_lmut = 0.0
+        self._acc_ltype = 0.0
+        self._acc_count = 0
+
+    def get_loss_breakdown(self, reset=True):
+        """Return accumulated sub-losses and optionally reset accumulators."""
+        if self._acc_count == 0:
+            return None
+        n = self._acc_count
+        l4 = self._acc_l4 / n
+        lmut = self._acc_lmut / n
+        ltype = self._acc_ltype / n
+        if reset:
+            self._reset_loss_accumulators()
+        return {
+            'l4': l4,
+            'lmut': lmut,
+            'ltype': ltype,
+            'weighted_lmut': self.w_mut * lmut,
+            'weighted_ltype': self.w_type * ltype,
+            'n_batches': n,
+        }
+
+    def _reduce(self, loss):
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        elif self.reduction == "none":
+            return loss
+        else:
+            raise ValueError(f"Unknown reduction: {self.reduction}")
+
+    def forward(self, out, y):
+        from MuRaL.models.gamma_mdn_model import \
+            gamma_total_dirichlet_subtype_predict_from_output
+
+        pred = gamma_total_dirichlet_subtype_predict_from_output(
+            out, eps=self.eps,
+        )
+
+        prob = pred["prob"]                    # (B, 4)
+        subtype_mix = pred["subtype_mix"]      # (B, 3)
+
+        # 1. Four-class NLL
+        log_prob = torch.log(prob + self.eps)
+        l4_per_sample = F.nll_loss(log_prob, y, reduction="none")  # (B,)
+        l4 = self._reduce(l4_per_sample)
+
+        # 2. Mutation vs non-mutation BCE
+        y_mut = (y > 0).float()
+        p_mut = 1.0 - prob[:, 0]
+        lmut_per_sample = F.binary_cross_entropy(
+            p_mut.clamp(self.eps, 1.0 - self.eps),
+            y_mut,
+            reduction="none",
+        )  # (B,)
+        lmut = self._reduce(lmut_per_sample)
+
+        # 3. Subtype CE, only for mutation samples
+        mut_mask = y > 0
+        if mut_mask.any():
+            y_type = y[mut_mask] - 1                 # {1,2,3} -> {0,1,2}
+            subtype_prob_mut = subtype_mix[mut_mask]  # (N_mut, 3)
+            log_subtype = torch.log(subtype_prob_mut + self.eps)
+            ltype = F.nll_loss(
+                log_subtype,
+                y_type,
+                weight=self.type_class_weight,
+                reduction=self.reduction,
+            )
+        else:
+            ltype = prob.sum() * 0.0
+
+        # Accumulate sub-loss breakdown for epoch-level diagnostic logging
+        self._acc_l4 += l4.item() if isinstance(l4, torch.Tensor) else l4
+        self._acc_lmut += lmut.item() if isinstance(lmut, torch.Tensor) else lmut
+        self._acc_ltype += ltype.item() if isinstance(ltype, torch.Tensor) else ltype
+        self._acc_count += 1
+
+        return l4 + self.w_mut * lmut + self.w_type * ltype
+
+    @staticmethod
+    def _unpack_pred(pred):
+        if isinstance(pred, (dict, PredictOutput)):
+            return pred
+        raise TypeError(
+            "pred should be dict-like with keys pi_logits, "
+            "gamma_alpha_raw, gamma_beta_raw, dir_alpha_raw."
         )
 
 
@@ -203,7 +589,7 @@ class LossFactory():
     def __init__(self) -> None:
         pass
 
-    def create_loss(self, loss_name=None, use_sample_weight=False, n_class=None):
+    def create_loss(self, loss_name=None, use_sample_weight=False, n_class=None, model_config=None):
         if loss_name is None or loss_name == 'CrossEntropy':
             if use_sample_weight:
                 return torch.nn.CrossEntropyLoss(reduction='none')
@@ -218,6 +604,18 @@ class LossFactory():
             return DirichletMDNClassificationLoss(reduction='sum')
         elif loss_name == 'GammaMDN':
             return GammaMDNClassificationLoss(reduction='sum')
+        elif loss_name == 'PoissonGammaMDN':
+            return PoissonGammaMDNClassificationLoss(reduction='sum')
+        elif loss_name == 'PoissonGammaLog':
+            log_alpha_max = model_config.get('log_alpha_max', 6.0) if model_config else 6.0
+            return PoissonGammaLogClassificationLoss(
+                reduction='sum', log_alpha_max=log_alpha_max)
+        elif loss_name == 'PoissonExact':
+            return PoissonExactClassificationLoss(reduction='sum')
+        elif loss_name == 'GammaTotalDirichletSubtype':
+            w_mut = model_config.get('w_mut', 0.2) if model_config else 0.2
+            w_type = model_config.get('w_type', 0.2) if model_config else 0.2
+            return GammaTotalDirichletSubtypeLoss(w_mut=w_mut, w_type=w_type, reduction='sum')
         else:
             raise ValueError(f"Unknown loss_name: {loss_name}")
 
@@ -367,6 +765,10 @@ class AdaptiveLossStrategy2():
         is_nb_loss = isinstance(criterion, NegativeBinomialLoss)
         is_dir_mdn = isinstance(criterion, DirichletMDNClassificationLoss)
         is_gamma_mdn = isinstance(criterion, GammaMDNClassificationLoss)
+        is_poisson_gamma_mdn = isinstance(criterion, PoissonGammaMDNClassificationLoss)
+        is_gamma_total_dirichlet = isinstance(criterion, GammaTotalDirichletSubtypeLoss)
+        is_poisson_gamma_log = isinstance(criterion, PoissonGammaLogClassificationLoss)
+        is_poisson_exact = isinstance(criterion, PoissonExactClassificationLoss)
         if is_nb_loss:
             mu = preds.get('mu')
             r = preds.get('r')
@@ -391,7 +793,7 @@ class AdaptiveLossStrategy2():
                 return (loss * sample_weight.squeeze()).sum()
             return loss
 
-        if is_dir_mdn or is_gamma_mdn:
+        if is_dir_mdn or is_gamma_mdn or is_poisson_gamma_mdn or is_gamma_total_dirichlet or is_poisson_gamma_log or is_poisson_exact:
             # MDN loss: preds dict passed directly to criterion
             loss = criterion(preds, y)
             loss_local1 = loss_local2 = loss_local3 = None
@@ -451,8 +853,8 @@ class AdaptiveLossStrategy2():
                 'loss' : self.total_loss} 
     
     def check_preds(self, preds):
-        if not isinstance(preds, dict):
-            sys.exit(f"Error: pred should be dict type, but input is {type(preds)}")
+        if not isinstance(preds, (dict, PredictOutput)):
+            sys.exit(f"Error: pred should be dict-like (has .get), but input is {type(preds)}")
 
     def _to_h1_label(self, y):
         """
@@ -571,8 +973,8 @@ class CombinedAvgMutLoss():
         return grouped_tensor
     
     def check_preds(self, preds):
-        if not isinstance(preds, dict):
-            sys.exit(f"Error: pred should be dict type, but input is {type(preds)}")
+        if not isinstance(preds, (dict, PredictOutput)):
+            sys.exit(f"Error: pred should be dict-like (has .get), but input is {type(preds)}")
 
     def check_labels(self, labels):
         if not isinstance(labels, dict):
@@ -715,8 +1117,8 @@ class SegmentCombinedLossStrategy():
     
     def check_preds(self, preds):
         for pred in preds:
-            if not isinstance(pred, dict):
-                sys.exit(f"Error: pred should be dict type, but input is {type(pred)}")
+            if not isinstance(pred, (dict, PredictOutput)):
+                sys.exit(f"Error: pred should be dict-like (has .get), but input is {type(pred)}")
 
     def check_labels(self, labels):
         if not isinstance(labels, dict):
@@ -793,8 +1195,8 @@ class SegmentCombinedWithGANLossStrategy():
     
     def check_preds(self, preds):
         for pred in preds:
-            if not isinstance(pred, dict):
-                sys.exit(f"Error: pred should be dict type, but input is {type(pred)}")
+            if not isinstance(pred, (dict, PredictOutput)):
+                sys.exit(f"Error: pred should be dict-like (has .get), but input is {type(pred)}")
 
     def check_labels(self, labels):
         if not isinstance(labels, dict):
@@ -866,8 +1268,8 @@ class SoftLabelUtilAvgSegmentWithGANLossStrategy():
     
     
     def check_preds(self, preds):
-        if not isinstance(preds, dict):
-            sys.exit(f"Error: pred should be dict type, but input is {type(preds)}")
+        if not isinstance(preds, (dict, PredictOutput)):
+            sys.exit(f"Error: pred should be dict-like (has .get), but input is {type(preds)}")
 
     def check_labels(self, labels):
         if not isinstance(labels, dict):
@@ -983,8 +1385,8 @@ class SoftLabelUtilAvgSegmentWithGANLossStrategy2():
     
     
     def check_preds(self, preds):
-        if not isinstance(preds, dict):
-            sys.exit(f"Error: pred should be dict type, but input is {type(preds)}")
+        if not isinstance(preds, (dict, PredictOutput)):
+            sys.exit(f"Error: pred should be dict-like (has .get), but input is {type(preds)}")
 
     def check_labels(self, labels):
         if not isinstance(labels, dict):

@@ -419,7 +419,7 @@ def main():
     # Set prob names for mutation types
 
     Observer = [TimeMinor(out_after_n_batch=1000), 
-                LossMinor(calc_loss_strategy_name, printer=print)]
+                LossMinor()]
 
     if args.use_bayesian:
         if is_nb_model:
@@ -430,12 +430,12 @@ def main():
         model.load_state_dict(model_state)
         model.to(device)
         predictor = BayesianPredictor(model, loss_calculator, criterion, device, config,
-                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name)
+                      observer=Observer, train_strategy=calc_loss_strategy_name)
     else:
         model.load_state_dict(model_state)
         model.to(device)
         predictor = Predictor(model, loss_calculator, criterion, device, config,
-                      observer=Observer, printer=print, train_strategy=calc_loss_strategy_name,
+                      observer=Observer, train_strategy=calc_loss_strategy_name,
                       collect_mu_r=is_nb_model,
                       collect_evidence=is_dir_mdn_model,
                       collect_gamma_mdn=is_gamma_mdn_model)

@@ -11,7 +11,7 @@ from enum import Enum, auto
 
 import torch.nn as nn
 import torch.nn.functional as F
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor, ContributionMinor2
+from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, ContributionMinor2
 
 class TrainerSubject:
     def __init__(self):
@@ -201,10 +201,10 @@ class BayesianTrainer(TrainerSubject):
         
     def _extract_final_pred(self, preds):
         preds = preds[0] if len(preds) == 2 else preds
-        if isinstance(preds, dict):
+        if hasattr(preds, 'get'):
             return preds['out']
         else:
-            assert isinstance(preds, torch.Tensor) , "preds must be a torch.Tensor or a dict with key 'out'"
+            assert isinstance(preds, torch.Tensor), "preds must be a torch.Tensor or dict-like with key 'out'"
             return preds
 
 class Trainer(TrainerSubject):
