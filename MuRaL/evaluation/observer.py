@@ -2,7 +2,7 @@ import time
 import numpy as np
 import sys
 import torch
-from MuRaL.evaluation.evaluation import print_gradients, print_gradient_norms
+from MuRaL.evaluation.gradient_utils import print_gradients, print_gradient_norms
 
 from typing import Dict, Any, Union
 
@@ -176,7 +176,7 @@ class UniversalLossRecorder:
 
 
 class LossMinor(Observer):
-    def __init__(self, calc_loss_strategy_name=None, printer=print):
+    def __init__(self, printer=print):
         self.loss_strategy = UniversalLossRecorder(printer=printer)
         self.printer = printer
         self.sample_number = 0
