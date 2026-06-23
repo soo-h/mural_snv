@@ -92,398 +92,98 @@ class GradMinor(Observer):
             if self.counter == self.out_after_n_batch:
                 self.out_grad(kwargs['model'])
         
-class LossMinorStrategy:
-    def __init__(self):
-        self.loss = []
+class UniversalLossRecorder:
+    """Records and reports loss breakdowns from any strategy.
+
+    Works with both modern dict-style losses and legacy tuple-style losses.
+    Keys are discovered dynamically from the first recorded batch.
+    """
+
+    def __init__(self, printer=print):
+        self.printer = printer
+        self.keys = None
+        self._init_buffers()
+
+    def _init_buffers(self):
+        # dict-mode: dynamic accumulators keyed by loss dict keys
+        self._buffers = {}
+        # tuple-mode: positional accumulators for legacy strategies
+        self._tuple_losses = []
 
     def record(self, loss):
-        raise NotImplementedError("Must implement record method.")
+        if isinstance(loss, dict):
+            self._record_dict(loss)
+        elif isinstance(loss, torch.Tensor):
+            self._tuple_losses.append(loss.item())
+        elif isinstance(loss, (tuple, list)):
+            self._tuple_losses.append([v.item() if isinstance(v, torch.Tensor) else v for v in loss])
 
-    def reset(self):
-        raise NotImplementedError("Must implement record method.")
-
-    def get_total_loss(self):
-        raise NotImplementedError("Must implement record method.")
-
-class OnlyCombinedLossMinorStrategy(LossMinorStrategy):
-    def __init__(self, printer=print):
-        super().__init__()
-        self.printer = printer
-
-    def record(self, loss):
-        self.loss.append(loss.item())
-    
-    def reset(self):
-        self.loss.clear()
-    
-    def out_mean_loss(self, dataset_class, sample_number):
-        self.printer(f"{dataset_class} Total Loss: {np.sum(self.loss) / sample_number}")
-        return {'loss' : self.loss}
-    
-class LocalDistalCombinedLossMinorStrategy(LossMinorStrategy):
-    def __init__(self, printer=print):
-        super().__init__()
-        self.local_loss = []
-        self.distal_loss = []
-        self.printer = printer 
-
-    def record(self, losses):
-        if len(losses) != 3:
-            raise ValueError("Expected losses to be a tuple of length 3.")
-        self.local_loss.append(losses[0].item())
-        self.distal_loss.append(losses[1].item())
-        self.loss.append(losses[2].item())  
-    
-    def reset(self):
-        self.local_loss.clear()
-        self.distal_loss.clear()
-        self.loss.clear()
-    
-    def out_mean_loss(self, dataset_class, sample_number):
-        self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}")
-        self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}")
-        self.printer(f"{dataset_class} Total Loss : {np.sum(self.loss) / sample_number}")
-        return {'loss' : self.loss}
-
-    def get_total_loss(self):
-        return super().get_total_loss()
-
-class LocalMidDistalCombinedLossMinorStrategy(LossMinorStrategy):
-    def __init__(self, printer=print):
-        super().__init__()
-        self.local_loss = []
-        self.distal_loss = []
-        self.mid_loss = []
-        self.printer = printer
-
-    def record(self, loss):
-        self.local_loss.append(loss[0].item())
-        self.mid_loss.append(loss[1].item())
-        self.distal_loss.append(loss[2].item())
-        self.loss.append(loss[3].item())
-
-    def reset(self):
-        self.loss.clear()
-        self.local_loss.clear()
-        self.distal_loss.clear()
-        self.mid_loss.clear()
-    
-    def out_mean_loss(self, dataset_class, sample_number):
-        self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}")
-        self.printer(f"{dataset_class} Mid Loss: {np.sum(self.mid_loss) / sample_number}")
-        self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}")
-        self.printer(f"{dataset_class} Total Loss : {np.sum(self.loss) / sample_number}")
-        return {'loss' : self.loss}
-
-class LocalMidDistalCombinedDecoderLossMinorStrategy(LossMinorStrategy):
-    def __init__(self, printer=print):
-        super().__init__()
-        self.local_loss = []
-        self.distal_loss = []
-        self.mid_loss = []
-        self.decoder_loss = []
-        self.printer = printer
-
-    def record(self, loss):
-        self.local_loss.append(loss[0].item())
-        self.mid_loss.append(loss[1].item())
-        self.distal_loss.append(loss[2].item())
-        self.loss.append(loss[3].item())
-        self.decoder_loss.append(loss[4].item())
-    
-    def reset(self):
-        self.local_loss.clear()
-        self.mid_loss.clear()
-        self.distal_loss.clear()
-        self.decoder_loss.clear()
-        self.loss.clear()
-        
-    
-    def out_mean_loss(self, dataset_class, sample_number):
-        self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}")
-        self.printer(f"{dataset_class} Mid Loss: {np.sum(self.mid_loss) / sample_number}")
-        self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}")
-        self.printer(f"{dataset_class} construct Loss : {np.sum(self.decoder_loss) / sample_number}")
-        self.printer(f"{dataset_class} Total Loss : {np.sum(self.loss) / sample_number}")
-        return {'loss' : self.loss}
-
-class AdaptiveLossMinorStrategy(LossMinorStrategy):
-    def __init__(self, printer=print) -> None:
-        super().__init__()
-        self._record_init()
-        self.printer = printer
-    
-    def _record_init(self):
-        self.loss = []
-        self.local_loss = []
-        self.distal_loss = []
-        self.mid_loss = []
-        self.decoder_loss = []
- 
-    
-    def record(self, loss):
-
-        if isinstance(loss, torch.Tensor):
-            self.loss.append(loss.item())
-        elif isinstance(loss, tuple):
-            if len(loss) == 3:
-                self.local_loss.append(loss[0].item())
-                self.distal_loss.append(loss[1].item())
-                self.loss.append(loss[2].item())
-            elif len(loss) == 4:
-                self.local_loss.append(loss[0].item())
-                self.mid_loss.append(loss[1].item())
-                self.distal_loss.append(loss[2].item())
-                self.loss.append(loss[3].item())
-            elif len(loss) == 5:
-                self.local_loss.append(loss[0].item())
-                self.mid_loss.append(loss[1].item())
-                self.distal_loss.append(loss[2].item())
-                self.loss.append(loss[3].item())
-                self.decoder_loss.append(loss[4].item())
-            else:
-                self.printer("Warming: Loss Record unnormal")
-    def reset(self):
-        self._record_init()
-
-    def out_mean_loss(self, dataset_class, sample_number):
-        if self.local_loss:
-            self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}")
-        if self.mid_loss:
-            self.printer(f"{dataset_class} Mid Loss: {np.sum(self.mid_loss) / sample_number}")
-        if self.distal_loss:
-            self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}")
-        if self.decoder_loss:
-            self.printer(f"{dataset_class} construct Loss : {np.sum(self.decoder_loss) / sample_number}")
-        if self.loss:
-            loss = np.sum(self.loss) / sample_number
-            self.printer(f"{dataset_class} Total Loss : {loss}") 
-        return {'loss' : loss}
-
-class AdaptiveLossStrategyLossMinorStrategy(LossMinorStrategy):
-    def __init__(self, printer=print):
-        super().__init__()
-        self.printer = printer
-        # self._record_init()
-        self.record_init = None
-
-    def reset(self):
-        self.record_init = None
-    
-    def _record_init(self, loss):
-        # to-del, 2026-1-5 save it for back compatibility
-        if not isinstance(loss, dict):
-            self.keys = ['loss', 'local_loss', 'mid_loss', 'distal_loss', 'local2_loss', 'local3_loss', 'avg_mut_loss_total']
-        else:
+    def _record_dict(self, loss):
+        if self.keys is None:
             self.keys = list(loss.keys())
-        # for key in ['loss', 'local_loss', 'mid_loss', 'distal_loss', 'local2_loss', 'local3_loss', 'avg_mut_loss_total']:
-        for key in self.keys:
-            setattr(self, key, [])
-
-        self.record_init = True
-
-        """ 
-        self.loss = []
-        self.local_loss = []
-        self.local2_loss = []
-        self.local3_loss = []
-        self.mid_loss = []
-        self.distal_loss = []
-        """
-
-    def record(self, loss):
-        if self.record_init is None:
-            self._record_init(loss)
-        
-        for key in self.keys:
-            if loss.get(key):
-                getattr(self, key).append(loss[key].item())
-
-        # for key in ['loss']:
-        #     getattr(self, key).append(loss[key].item())
-        # for key in ['local2_loss', 'local3_loss', 'distal_loss', 'local_loss', 'mid_loss', 'avg_mut_loss_total']:
-        #     if loss.get(key):
-        #         getattr(self, key).append(loss[key].item())
-
-    def out_mean_loss(self, dataset_class, sample_number):
-        for key in self.keys:
-            self.printer(f"{dataset_class} {key}: {np.sum(getattr(self, key)) / sample_number}; Batch Var: {np.var(getattr(self, key))}")
-
-        # if self.local_loss:
-        #     self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}; Batch Var: {np.var(self.local_loss)}")
-        # if self.local2_loss:
-        #     self.printer(f"{dataset_class} Local2 Loss: {np.sum(self.local2_loss) / sample_number}; Batch Var: {np.var(self.local2_loss)}")
-        # if self.local3_loss:
-        #     self.printer(f"{dataset_class} Local3 Loss: {np.sum(self.local3_loss) / sample_number}; Batch Var: {np.var(self.local3_loss)}")
-        # if self.mid_loss:
-        #     self.printer(f"{dataset_class} Mid Loss: {np.sum(self.mid_loss) / sample_number}; Batch Var: {np.var(self.mid_loss)}")
-        # if self.distal_loss:
-        #     self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}; Batch Var: {np.var(self.distal_loss)}")
-        # if self.avg_mut_loss_total:
-        #     self.printer(f"{dataset_class} Avg Mut Loss: {np.sum(self.avg_mut_loss_total) / sample_number}; Batch Var: {np.var(self.avg_mut_loss_total)}")
-        # self.printer(f"{dataset_class} Total Loss(Mix Loss) : {np.sum(self.loss) / sample_number} ; Batch Var: {np.var(self.loss)}")
-
-        return {'loss' : np.sum(self.loss) / sample_number}
-    
-class SegmentCombinedLossMinorStrategy(LossMinorStrategy):
-    def __init__(self, printer=print):
-        super().__init__()
-        self.printer = printer
-        self._record_init()
+            for k in self.keys:
+                self._buffers[k] = []
+        for k in self.keys:
+            v = loss.get(k)
+            if v is not None:
+                self._buffers[k].append(v.item())
 
     def reset(self):
-        self._record_init()
-    
-    def _record_init(self):
-        self.loss = []
-        self.local_loss = []
-        self.mid_loss = []
-        self.distal_loss = []
-        self.segment_id_loss = []
-        self.avg_mut_loss = []
-        self.avg_kmer_mut_loss = []
-
-        self.total_loss = []
-        self.discrim_loss = []
-        self.construct_loss = []
-
-    def record(self, loss):
-        self.loss.append(loss['loss'].item())
-        self.local_loss.append(loss['local_loss'].item())
-        self.mid_loss.append(loss['mid_loss'].item())
-        self.distal_loss.append(loss['distal_loss'].item())
-        if loss.get('segment_id_loss'):
-            self.segment_id_loss.append(loss['segment_id_loss'].item())
-        self.avg_mut_loss.append(loss['avg_mut_loss'].item())
-        # not torch
-        if loss.get('total_loss'):
-            self.total_loss.append(loss['total_loss'].item())
-        if loss.get('avg_kmer_mut_loss'):
-            self.avg_kmer_mut_loss.append(loss['avg_kmer_mut_loss'].item())
-        if loss.get('discrim_loss'):
-            self.discrim_loss.append(loss['discrim_loss'])
-        # torch
-        if loss.get('construct_loss'):
-            self.construct_loss.append(loss['construct_loss'].item())
-
-
+        self.keys = None
+        self._init_buffers()
 
     def out_mean_loss(self, dataset_class, sample_number):
-        self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}")
-        self.printer(f"{dataset_class} Mid Loss: {np.sum(self.mid_loss) / sample_number}")
-        self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}")
-        self.printer(f"{dataset_class} Avg Mut Loss: {np.sum(self.avg_mut_loss) / sample_number}")
-        self.printer(f"{dataset_class} Total Loss(Main Loss) : {np.sum(self.loss) / sample_number}")
-        if self.segment_id_loss:
-            self.printer(f"{dataset_class} Segment Id Loss : {np.sum(self.segment_id_loss) / sample_number}")
-        if self.avg_kmer_mut_loss:
-            self.printer(f"{dataset_class} Avg Kmer Mut Loss : {np.sum(self.avg_kmer_mut_loss) / sample_number}")
-        if self.total_loss:
-            self.printer(f"{dataset_class} Total Loss(Combined Loss) : {np.sum(self.total_loss) / sample_number}")
-        if self.discrim_loss:
-            self.printer(f"{dataset_class} Discrim Loss: {np.sum(self.discrim_loss) / sample_number}; Batch Var: {np.var(self.discrim_loss)}")
-        if self.construct_loss:
-            self.printer(f"{dataset_class} Construct Loss (mean): {np.sum(self.construct_loss) / sample_number}; Batch Var: {np.var(self.construct_loss)}")
+        if self._tuple_losses:
+            total = self._out_tuple_loss(dataset_class, sample_number)
+        else:
+            total = self._out_dict_loss(dataset_class, sample_number)
+        return {'loss': total / sample_number if sample_number else 0}
 
-        return {'loss' : np.sum(self.loss) / sample_number}
+    def _out_dict_loss(self, dataset_class, sample_number):
+        total = 0
+        for k in self.keys:
+            if self._buffers[k]:
+                arr = np.array(self._buffers[k])
+                self.printer(f"{dataset_class} {k}: {arr.sum() / sample_number}; "
+                             f"Batch Var: {arr.var()}")
+        k = 'total_loss' if 'total_loss' in (self.keys or []) else 'loss'
+        if self.keys and k in self.keys and self._buffers.get(k):
+            total = np.sum(self._buffers[k])
+        elif self.keys:
+            for k in self.keys:
+                if self._buffers.get(k):
+                    total = np.sum(self._buffers[k])
+                    break
+        return total
 
-class SoftLabelUtilAvgSegmentWithGANMinorStrategy(LossMinorStrategy):
-    def __init__(self, printer=print):
-        super().__init__()
-        self.printer = printer
-        self._record_init()
-
-    def reset(self):
-        self._record_init()
-    
-    def _record_init(self):
-        self.loss = []
-        self.local_loss = []
-        self.mid_loss = []
-        self.distal_loss = []
-
-        self.construct_loss = []
-        
-        self.hard_label_loss = []
-        self.soft_label_loss = []
-        self.mix_loss = []
-
-    def record(self, loss):
-        self.loss.append(loss['loss'].item())
-        self.local_loss.append(loss['local_loss'].item())
-        self.mid_loss.append(loss['mid_loss'].item())
-        self.distal_loss.append(loss['distal_loss'].item())
-
-        # torch
-        if loss.get('construct_loss') is not None:
-            self.construct_loss.append(loss['construct_loss'].item())
-
-        if loss.get('soft_label_loss') is not None:
-            self.soft_label_loss.append(loss['soft_label_loss'].item())
-
-        if loss.get('mix_loss') is not None:
-            self.mix_loss.append(loss['mix_loss'].item())
-        
-        self.hard_label_loss.append(loss['hard_label_loss'].item())
-
-
-
-    def out_mean_loss(self, dataset_class, sample_number):
-        self.printer(f"{dataset_class} Local Loss: {np.sum(self.local_loss) / sample_number}; Batch Var: {np.var(self.local_loss)}")
-        self.printer(f"{dataset_class} Mid Loss: {np.sum(self.mid_loss) / sample_number}; Batch Var: {np.var(self.mid_loss)}")
-        self.printer(f"{dataset_class} Distsal Loss: {np.sum(self.distal_loss) / sample_number}; Batch Var: {np.var(self.distal_loss)}")
-        self.printer(f"{dataset_class} Total Loss(Mix Loss) : {np.sum(self.loss) / sample_number} ; Batch Var: {np.var(self.loss)}")
-
-        if self.construct_loss:
-            self.printer(f"{dataset_class} Construct Loss (mean): {np.sum(self.construct_loss) / sample_number}; Batch Var: {np.var(self.construct_loss)}")
-
-        if self.soft_label_loss:
-            self.printer(f"{dataset_class} Soft Loss (mean): {np.sum(self.soft_label_loss) / sample_number}; Batch Var: {np.var(self.construct_loss)}")
-
-        self.printer(f"{dataset_class} Hard Label Loss: {np.sum(self.hard_label_loss) / sample_number}; Batch Var: {np.var(self.hard_label_loss)}")
-
-        if self.mix_loss:
-            self.printer(f"{dataset_class} Mix Loss (mean): {np.sum(self.mix_loss) / sample_number}; Batch Var: {np.var(self.construct_loss)}")
-
-        return {'loss' : np.sum(self.loss) / sample_number}
+    def _out_tuple_loss(self, dataset_class, sample_number):
+        first = self._tuple_losses[0]
+        if isinstance(first, list):
+            labels = {3: ['Local', 'Distal', 'Total'],
+                      4: ['Local', 'Mid', 'Distal', 'Total'],
+                      5: ['Local', 'Mid', 'Distal', 'Total', 'Construct']}
+            names = labels.get(len(first), [f'loss_{i}' for i in range(len(first))])
+            for i, name in enumerate(names):
+                vals = [row[i] for row in self._tuple_losses]
+                self.printer(f"{dataset_class} {name} Loss: {np.sum(vals) / sample_number}; "
+                             f"Batch Var: {np.var(vals)}")
+            return np.sum([row[-1] for row in self._tuple_losses])
+        else:
+            total = np.sum(self._tuple_losses)
+            self.printer(f"{dataset_class} Total Loss: {total / sample_number}; "
+                         f"Batch Var: {np.var(self._tuple_losses)}")
+            return total
 
 
 class LossMinor(Observer):
-    strategy_map = {
-        'OnlyCombined': OnlyCombinedLossMinorStrategy,
-        'LocalDistalCombined': LocalDistalCombinedLossMinorStrategy,
-        'LocalMidDistalCombined': LocalMidDistalCombinedLossMinorStrategy,
-        'LocalMidDistalCombinedDecoder': LocalMidDistalCombinedDecoderLossMinorStrategy,  # Add as needed
-        'segment_soft_label' : SegmentCombinedLossMinorStrategy,
-        'segment_soft_label_step' : SegmentCombinedLossMinorStrategy,
-        'segment_soft_label_step_withGAN' : SegmentCombinedLossMinorStrategy,
-
-        'AvgSegmentLabel_withGAN' : SoftLabelUtilAvgSegmentWithGANMinorStrategy,
-        'AvgSegmentLabel_withGAN2' : SoftLabelUtilAvgSegmentWithGANMinorStrategy,
-
-        'AvgSegMutUseInLocal' : AdaptiveLossStrategyLossMinorStrategy,
-        'AvgSegMutAndKmerMut' : SegmentCombinedLossMinorStrategy,
-        'AvgSegMutAndNucSkewUseInLocal' : AdaptiveLossStrategyLossMinorStrategy,
-        'AvgSegMutAndKmerMutUseInLocal': AdaptiveLossStrategyLossMinorStrategy,
-        'AvgStepMutAndKmerMutUseInLocal': AdaptiveLossStrategyLossMinorStrategy,
-        'AvgStepMutAndKmerMutCominedLoss': AdaptiveLossStrategyLossMinorStrategy,
-        'SKA_local' : AdaptiveLossStrategyLossMinorStrategy,
-    }
-
     def __init__(self, calc_loss_strategy_name=None, printer=print):
-        if calc_loss_strategy_name is None:
-            self.loss_strategy = AdaptiveLossStrategyLossMinorStrategy()
-
-        else:
-            if calc_loss_strategy_name not in self.strategy_map:
-                sys.exit(f"Error: Unsupported strategy name not in {self.strategy_map}")
-            self.loss_strategy = self.strategy_map[calc_loss_strategy_name]()
+        self.loss_strategy = UniversalLossRecorder(printer=printer)
         self.printer = printer
         self.sample_number = 0
 
     def record_loss(self, loss):
         self.loss_strategy.record(loss)
-    
+
     def record_sample_number(self, sample_number):
         self.sample_number += sample_number
 
@@ -501,9 +201,8 @@ class LossMinor(Observer):
             self.record_loss(kwargs['losses'])
             self.record_sample_number(kwargs['sample_number'])
         if 'train_step_finish' in kwargs:
-            minor_dict = self.out_mean_losses(dataset_class="Training", sample_number=self.sample_number)
+            self.out_mean_losses(dataset_class="Training", sample_number=self.sample_number)
             return {}
-
         if 'valid_step_finish' in kwargs:
             minor_dict = self.out_mean_losses(dataset_class="Validation", sample_number=self.sample_number)
             return {'valid_loss': minor_dict['loss']}
@@ -1394,3 +1093,115 @@ class ContributionMinor2(Observer):
         if len(preds) in length_map:
             return dict(zip(length_map[len(preds)], preds))
         raise ValueError("Unsupported tuple format for sub-model predictions.")
+
+
+class GammaTotalDirichletRecoder(Observer):
+    """Collect pi_entropy and raw parameters during Gamma-Total-Dirichlet MDN prediction.
+
+    - output() returns pi_entropy
+    - get_components() returns (gamma_alpha_raw, gamma_beta_raw, dir_alpha_raw)
+    - reset() clears all buffers (caller's responsibility)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pi_entropy = None
+        self.pi_logits = None
+        self.gamma_alpha_raw = None
+        self.gamma_beta_raw = None
+        self.dir_alpha_raw = None
+
+    def reset(self):
+        self.pi_entropy = None
+        self.pi_logits = None
+        self.gamma_alpha_raw = None
+        self.gamma_beta_raw = None
+        self.dir_alpha_raw = None
+
+    def recode(self, preds):
+        predict_out, _ = preds if isinstance(preds, tuple) else (preds, None)
+        if 'pi_logits' not in predict_out:
+            return
+        from MuRaL.models.gamma_mdn_model import compute_mdn_uncertainty
+        with torch.no_grad():
+            uncertainty = compute_mdn_uncertainty(predict_out)
+            entropy = uncertainty['pi_entropy'].cpu()
+        self.pi_entropy = (
+            entropy if self.pi_entropy is None
+            else torch.cat([self.pi_entropy, entropy], dim=0)
+        )
+        pi = predict_out['pi_logits'].detach().cpu()
+        self.pi_logits = (
+            pi if self.pi_logits is None
+            else torch.cat([self.pi_logits, pi], dim=0)
+        )
+        ga = predict_out['gamma_alpha_raw'].detach().cpu()
+        gb = predict_out['gamma_beta_raw'].detach().cpu()
+        da = predict_out['dir_alpha_raw'].detach().cpu()
+        self.gamma_alpha_raw = (
+            ga if self.gamma_alpha_raw is None
+            else torch.cat([self.gamma_alpha_raw, ga], dim=0)
+        )
+        self.gamma_beta_raw = (
+            gb if self.gamma_beta_raw is None
+            else torch.cat([self.gamma_beta_raw, gb], dim=0)
+        )
+        self.dir_alpha_raw = (
+            da if self.dir_alpha_raw is None
+            else torch.cat([self.dir_alpha_raw, da], dim=0)
+        )
+
+    def output(self):
+        return self.pi_entropy
+
+    def get_components(self):
+        return self.pi_logits, self.gamma_alpha_raw, self.gamma_beta_raw, self.dir_alpha_raw
+
+    def update(self, **kwargs):
+        if 'valid_preds' in kwargs:
+            self.recode(kwargs['valid_preds'])
+
+
+class GammaLambdaRecoder(Observer):
+    """Collect mixture-weighted mutation intensity lambda during validation.
+
+    λ_{k,i} = α_{k,i} / β_{k,i}, then pi-weighted sum to (B, C).
+    Supports both softplus and log-parameterized activation.
+    """
+
+    def __init__(self, gamma_activation='softplus'):
+        super().__init__()
+        self.lam = None
+        self.gamma_activation = gamma_activation
+
+    def reset(self):
+        self.lam = None
+
+    def recode(self, preds):
+        import torch.nn.functional as F
+        predict_out, _ = preds if isinstance(preds, tuple) else (preds, None)
+        if 'alpha_raw' not in predict_out:
+            return
+
+        alpha_raw = predict_out['alpha_raw'].detach()
+        beta_raw = predict_out['beta_raw'].detach()
+
+        if self.gamma_activation == 'log':
+            from MuRaL.models.gamma_mdn_model import activate_gamma_alpha_beta
+            alpha, beta = activate_gamma_alpha_beta(alpha_raw, beta_raw)
+        else:
+            alpha = F.softplus(alpha_raw) + 1e-8
+            beta = F.softplus(beta_raw) + 1e-8
+
+        lam = alpha / beta                                              # (B, K, C)
+        pi = F.softmax(predict_out['pi_logits'].detach(), dim=1)       # (B, K)
+        lam_mix = (pi.unsqueeze(-1) * lam).sum(dim=1).cpu()            # (B, C)
+
+        self.lam = lam_mix if self.lam is None else torch.cat([self.lam, lam_mix], dim=0)
+
+    def output(self):
+        return self.lam
+
+    def update(self, **kwargs):
+        if 'valid_preds' in kwargs:
+            self.recode(kwargs['valid_preds'])
