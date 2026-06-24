@@ -90,7 +90,12 @@ def _add_file_handler(root, path, fmt, level):
 def get_logger(name='mural'):
     """Get a logger for a specific sub-module.
 
-    >>> logger = get_logger('mural.observer')
+    The name is always prefixed with 'mural.' so output routes to the
+    handlers configured by setup_logging().
+
+    >>> logger = get_logger(__name__)
     >>> logger.info("hello")
     """
-    return logging.getLogger(name)
+    if name == 'mural':
+        return logging.getLogger('mural')
+    return logging.getLogger('mural.' + name)

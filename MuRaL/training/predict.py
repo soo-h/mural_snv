@@ -28,7 +28,7 @@ class Predictor(TrainerSubject):
         self.collect_gamma_total_dirichlet = collect_gamma_total_dirichlet
 
         if observer is None:
-            self.observer = [TimeMinor(out_after_n_batch=1000),LossMinor()]
+            self.observer = [TimeMinor(out_after_n_batch=1000)]
         else:
             self.observer = observer
 
@@ -68,17 +68,13 @@ class Predictor(TrainerSubject):
                 batch = self.load_to_device(batch, self.device)
                 label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
                 valid_preds = model_predict(inputs, self.model, self.train_strategy)
-                #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
-                losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
-                #valid_pred = self.LossCalculator.extract_pred(valid_preds)
                 sample_number = batch[0].shape[0]
 
-                self.notify_observers(losses = losses,
-                                      sample_number = sample_number,
-                                      valid_preds = valid_preds,
+                self.notify_observers(sample_number=sample_number,
+                                      valid_preds=valid_preds,
                                       label=label)
 
-            self.notify_observers(valid_step_finish = True)
+            self.notify_observers(valid_step_finish=True)
         valid_step_time = time.time() - valid_step_time
         logger.info("Prediction used time: %.1f mins", valid_step_time / 60)
         valid_preds = self.valid_preds_recoder.output()
@@ -94,7 +90,7 @@ class Predictor(TrainerSubject):
         if self.collect_gamma_total_dirichlet:
             self.remove_observer(self._gamma_total_dirichlet_recoder)
         return valid_preds
-    
+
     def predict_each_model(self, dataloader_test):
         self.register_observer(self.each_model_preds_recoder)
         self.register_observer(self.contribution_minor_split_mut_type)
@@ -105,16 +101,11 @@ class Predictor(TrainerSubject):
                 batch = self.load_to_device(batch, self.device)
                 label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
                 valid_preds = model_predict(inputs, self.model, self.train_strategy)
-                #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
-                losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
-                #valid_pred = self.LossCalculator.extract_pred(valid_preds)
                 sample_number = batch[0].shape[0]
 
-                self.notify_observers(losses = losses,
-                                      sample_number = sample_number,
-                                      valid_preds = valid_preds,
-                                      label = label
-                                      )
+                self.notify_observers(sample_number=sample_number,
+                                      valid_preds=valid_preds,
+                                      label=label)
             
             self.notify_observers(valid_step_finish = True)
         valid_step_time = time.time() - valid_step_time
@@ -220,7 +211,7 @@ class BayesianPredictor(TrainerSubject):
         self.model_predict = model_train_register(self.train_strategy)
 
         if observer is None:
-            self.observer = [TimeMinor(out_after_n_batch=1000),LossMinor()]
+            self.observer = [TimeMinor(out_after_n_batch=1000)]
         else:
             self.observer = observer
 
@@ -260,17 +251,15 @@ class BayesianPredictor(TrainerSubject):
                 pred_y_ensemble = torch.cat((pred_y_ensemble, means), dim=0)
                 pred_y_uncertain = torch.cat((pred_y_uncertain, stds), dim=0)
 
-                losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion)
                 sample_number = batch[0].shape[0]
 
-                self.notify_observers(losses = losses,
-                                      sample_number = sample_number,
-                                      valid_preds = valid_preds,
+                self.notify_observers(sample_number=sample_number,
+                                      valid_preds=valid_preds,
                                       label=label)
-            
-            self.notify_observers(valid_step_finish = True)
+
+            self.notify_observers(valid_step_finish=True)
         valid_step_time = time.time() - valid_step_time
-        logger.info("Prediction used time: %.1f mins", valid_step_time / 60)
+        logger.info("Bayesian prediction used time: %.1f mins", valid_step_time / 60)
         valid_preds = self.valid_preds_recoder.output()
 
         self.remove_observer(self.valid_preds_recoder)

@@ -585,6 +585,81 @@ class GammaTotalDirichletSubtypeLoss(nn.Module):
         )
 
 
+class GammaTotalDirichletExactLoss(nn.Module):
+    """Gamma-Total-Dirichlet MDN loss with exact Gamma-Poisson marginal.
+
+    L = L_4class + w_mut * L_mut + w_type * L_type
+
+    L_4class uses P(no mutation) = (β/(β+1))^α  (exact, not exp(-λ)).
+    """
+
+    def __init__(self, w_mut=0.2, w_type=0.2, eps=1e-8, reduction='sum'):
+        super().__init__()
+        self.w_mut = w_mut
+        self.w_type = w_type
+        self.eps = eps
+        self.reduction = reduction
+        self._reset_loss_accumulators()
+
+    def _reset_loss_accumulators(self):
+        self._acc_l4 = 0.0
+        self._acc_lmut = 0.0
+        self._acc_ltype = 0.0
+        self._acc_count = 0
+
+    def get_loss_breakdown(self, reset=True):
+        if self._acc_count == 0:
+            return None
+        n = self._acc_count
+        l4 = self._acc_l4 / n
+        lmut = self._acc_lmut / n
+        ltype = self._acc_ltype / n
+        if reset:
+            self._reset_loss_accumulators()
+        return {'l4': l4, 'weighted_lmut': self.w_mut * lmut, 'weighted_ltype': self.w_type * ltype, 'n_batches': n}
+
+    def _reduce(self, loss):
+        if self.reduction == 'mean': return loss.mean()
+        elif self.reduction == 'sum': return loss.sum()
+        elif self.reduction == 'none': return loss
+        raise ValueError(f"Unknown reduction: {self.reduction}")
+
+    def forward(self, out, y):
+        from MuRaL.models.gamma_mdn_model import gamma_total_dirichlet_exact_predict_from_output
+
+        pred = gamma_total_dirichlet_exact_predict_from_output(out, eps=self.eps)
+        prob = pred['prob']                    # (B, 4)
+        subtype_mix = pred['subtype_mix']      # (B, 3)
+
+        # 1. Four-class NLL
+        log_prob = torch.log(prob + self.eps)
+        l4_per_sample = F.nll_loss(log_prob, y, reduction='none')
+        l4 = self._reduce(l4_per_sample)
+
+        # 2. Mutation vs non-mutation BCE
+        y_mut = (y > 0).float()
+        p_mut = 1.0 - prob[:, 0]
+        lmut_per_sample = F.binary_cross_entropy(p_mut.clamp(self.eps, 1.0 - self.eps), y_mut, reduction='none')
+        lmut = self._reduce(lmut_per_sample)
+
+        # 3. Subtype CE (only for mutation samples)
+        mut_mask = y > 0
+        if mut_mask.any():
+            y_type = y[mut_mask] - 1
+            subtype_prob_mut = subtype_mix[mut_mask]
+            log_subtype = torch.log(subtype_prob_mut + self.eps)
+            ltype = F.nll_loss(log_subtype, y_type, reduction=self.reduction)
+        else:
+            ltype = prob.sum() * 0.0
+
+        self._acc_l4 += l4.item() if isinstance(l4, (torch.Tensor)) else l4
+        self._acc_lmut += lmut.item() if isinstance(lmut, (torch.Tensor)) else lmut
+        self._acc_ltype += ltype.item() if isinstance(ltype, (torch.Tensor)) else ltype
+        self._acc_count += 1
+
+        return l4 + self.w_mut * lmut + self.w_type * ltype
+
+
 class LossFactory():
     def __init__(self) -> None:
         pass
@@ -612,6 +687,10 @@ class LossFactory():
                 reduction='sum', log_alpha_max=log_alpha_max)
         elif loss_name == 'PoissonExact':
             return PoissonExactClassificationLoss(reduction='sum')
+        elif loss_name == 'GammaTotalDirichletExact':
+            w_mut = model_config.get('w_mut', 0.2) if model_config else 0.2
+            w_type = model_config.get('w_type', 0.2) if model_config else 0.2
+            return GammaTotalDirichletExactLoss(w_mut=w_mut, w_type=w_type, reduction='sum')
         elif loss_name == 'GammaTotalDirichletSubtype':
             w_mut = model_config.get('w_mut', 0.2) if model_config else 0.2
             w_type = model_config.get('w_type', 0.2) if model_config else 0.2
@@ -769,6 +848,7 @@ class AdaptiveLossStrategy2():
         is_gamma_total_dirichlet = isinstance(criterion, GammaTotalDirichletSubtypeLoss)
         is_poisson_gamma_log = isinstance(criterion, PoissonGammaLogClassificationLoss)
         is_poisson_exact = isinstance(criterion, PoissonExactClassificationLoss)
+        is_gamma_total_dirichlet_exact = isinstance(criterion, GammaTotalDirichletExactLoss)
         if is_nb_loss:
             mu = preds.get('mu')
             r = preds.get('r')
@@ -793,15 +873,16 @@ class AdaptiveLossStrategy2():
                 return (loss * sample_weight.squeeze()).sum()
             return loss
 
-        if is_dir_mdn or is_gamma_mdn or is_poisson_gamma_mdn or is_gamma_total_dirichlet or is_poisson_gamma_log or is_poisson_exact:
+        if is_dir_mdn or is_gamma_mdn or is_poisson_gamma_mdn or is_gamma_total_dirichlet or is_poisson_gamma_log or is_poisson_exact or is_gamma_total_dirichlet_exact:
             # MDN loss: preds dict passed directly to criterion
             loss = criterion(preds, y)
             loss_local1 = loss_local2 = loss_local3 = None
             loss_mid = loss_distal = None
             loss_arg_feature = None
-            loss_dual_head = 0
+            loss_dual_head = None
+            self.total_loss = loss
         elif is_nb_loss:
-            # NB loss：只有 out 有已激活的 mu/r，其余子模型输出 raw logits → None
+            # NB loss
             loss = _calc_loss(mu, y, r=r)
             loss_local1 = _calc_loss(None, y)
             loss_local2 = _calc_loss(None, y)
@@ -809,9 +890,10 @@ class AdaptiveLossStrategy2():
             loss_mid = _calc_loss(None, y)
             loss_distal = _calc_loss(None, y)
             loss_arg_feature = _calc_loss(None, y)
-            loss_dual_head = 0
+            loss_dual_head = None
+            self.total_loss = loss
         else:
-            # CE loss：分量正常计算
+            # CE loss
             mid = preds.get('mid')
             distal = preds.get('distal')
             out = preds.get('out')
@@ -832,7 +914,7 @@ class AdaptiveLossStrategy2():
             arg_feature = preds.get('arg_feature')
             loss_arg_feature = _calc_loss(arg_feature, y)
 
-            loss_dual_head = 0
+            loss_dual_head = None
             if 'local_h1' in preds:
                 assert 'local_h2' in preds, "Both local_h1 and local_h2 should be present"
                 loss_local_h1 = _calc_loss(preds['local_h1'], self._to_h1_label(y))
@@ -840,8 +922,7 @@ class AdaptiveLossStrategy2():
                 loss_dual_head = loss_local_h1 + loss_local_h2
 
             loss = _calc_loss(out, y)
-
-        self.total_loss = loss + 0.25 * loss_dual_head
+            self.total_loss = loss + 0.25 * (loss_dual_head if loss_dual_head is not None else 0)
 
         return {'local_loss': loss_local1,
                 'local2_loss' : loss_local2,

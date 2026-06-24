@@ -29,7 +29,7 @@ from MuRaL.evaluation.evaluation import *
 from MuRaL.data.preprocessing import *
 from MuRaL.data.dataset import dict_to_tuple_collate
 from MuRaL.models.custom_loss import *
-from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss, PoissonGammaMDNClassificationLoss, GammaTotalDirichletSubtypeLoss, PoissonGammaLogClassificationLoss, PoissonExactClassificationLoss
+from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss, PoissonGammaMDNClassificationLoss, GammaTotalDirichletSubtypeLoss, PoissonGammaLogClassificationLoss, PoissonExactClassificationLoss, GammaTotalDirichletExactLoss
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
 from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder, GammaLambdaRecoder
@@ -207,6 +207,21 @@ def train(config, args, checkpoint_dir=None):
                 f"GammaMDN loss requires a GammaMDN model variant "
                 f"(e.g. 151_gamma_mdn), but got model_no={args.model_no}"
             )
+    is_gamma_total_dirichlet_exact = isinstance(criterion, GammaTotalDirichletExactLoss)
+    if is_gamma_total_dirichlet_exact:
+        if '_gamma_total_dirichlet_mdn_exact' not in str(args.model_no):
+            raise ValueError(
+                f"GammaTotalDirichletExact loss requires model "
+                f"(e.g. 151_gamma_total_dirichlet_mdn_exact), got model_no={args.model_no}"
+            )
+    is_gamma_total_dirichlet = isinstance(criterion, GammaTotalDirichletSubtypeLoss) and not is_gamma_total_dirichlet_exact
+    if is_gamma_total_dirichlet:
+        if '_gamma_total_dirichlet_mdn' not in str(args.model_no) or '_exact' in str(args.model_no):
+            raise ValueError(
+                f"GammaTotalDirichlet loss requires a GammaTotalDirichlet model variant "
+                f"(e.g. 151_gamma_total_dirichlet_mdn), got model_no={args.model_no}"
+            )
+    is_any_gamma_mdn = is_gamma_mdn or is_gamma_total_dirichlet or is_gamma_total_dirichlet_exact
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=args.mix_loss)
 
     config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto, config['weight_decay'])
@@ -242,6 +257,7 @@ def train(config, args, checkpoint_dir=None):
     dir_mdn_recoder = DirMDNRecoder() if is_dir_mdn else None
 
     pi_entropy_recoder = GammaMDNRecoder() if is_gamma_mdn else None
+    gamma_total_dirichlet_recoder = GammaTotalDirichletRecoder() if is_gamma_total_dirichlet else None
 
     if not args.use_ray:
         early_stopping = EarlyStopping(patience=args.grace_period, verbose=True)
@@ -260,6 +276,8 @@ def train(config, args, checkpoint_dir=None):
         else:
             if is_dir_mdn:
                 trainer.register_observer(dir_mdn_recoder)
+            if is_gamma_total_dirichlet:
+                trainer.register_observer(gamma_total_dirichlet_recoder)
             if is_gamma_mdn:
                 trainer.register_observer(pi_entropy_recoder)
             valid_pred_y = trainer.valid_step(dataloader_valid)
@@ -282,6 +300,15 @@ def train(config, args, checkpoint_dir=None):
                 valid_evidence = to_np(valid_evidence_t)
             dir_mdn_recoder.reset()
             trainer.remove_observer(dir_mdn_recoder)
+
+        # Extract evidence/pi_entropy for GammaTotalDirichlet models
+        valid_evidence = None
+        if is_gamma_total_dirichlet:
+            valid_evidence_t = gamma_total_dirichlet_recoder.output()
+            if valid_evidence_t is not None:
+                valid_evidence = to_np(valid_evidence_t)
+            gamma_total_dirichlet_recoder.reset()
+            trainer.remove_observer(gamma_total_dirichlet_recoder)
 
         # Extract pi_entropy for GammaMDN models
         valid_pi_entropy = None
@@ -311,7 +338,7 @@ def train(config, args, checkpoint_dir=None):
         if is_nb:
             evaluator_before_calibra = NBEvaluator(data_local_valid, valid_y_prob, n_class, mu=valid_mu, r=valid_r, use_obs_count=args.recurrent)
             evaluator_after_calibra = NBEvaluator(data_local_valid, prob_cal, n_class, mu=valid_mu, r=valid_r, calibra="FullDiri", use_obs_count=args.recurrent)
-        elif is_gamma_mdn:
+        elif is_any_gamma_mdn:
             evaluator_before_calibra = GammaMDNEvaluator(data_local_valid, valid_y_prob, n_class, pi_entropy=valid_pi_entropy, use_obs_count=args.recurrent)
             evaluator_after_calibra = GammaMDNEvaluator(data_local_valid, prob_cal, n_class, pi_entropy=valid_pi_entropy, calibra="FullDiri", use_obs_count=args.recurrent)
         elif is_dir_mdn:
@@ -328,10 +355,14 @@ def train(config, args, checkpoint_dir=None):
             evaluator_before_calibra.evaluate_kmer_var(kmer_list=[3])
             evaluator_after_calibra.evaluate_kmer_var()
 
-        if is_gamma_mdn:
+        if is_any_gamma_mdn:
             evaluator_before_calibra.evaluate_entropy_calibration()
             logger.info("After calibration:")
             evaluator_after_calibra.evaluate_entropy_calibration()
+            if is_gamma_total_dirichlet:
+                evaluator_before_calibra.evaluate_evidence_calibration()
+                logger.info("After calibration:")
+                evaluator_after_calibra.evaluate_evidence_calibration()
 
         if is_dir_mdn:
             evaluator_before_calibra.evaluate_evidence_calibration()
@@ -474,10 +505,10 @@ class Evaluator:
 
     def evaluate_kmer(self, kmer_list=[3,5,7]):
         if self.calibra is None:
-            logger.info("valid_data_and_prob.iloc[0:10]", self.data_and_prob.iloc[0:10])
+            logger.info("valid_data_and_prob.iloc[0:10]:\n%s", self.data_and_prob.iloc[0:10])
         for k in kmer_list:
             kmer_corr = freq_kmer_comp_multi(self.data_and_prob, k, self.n_class, self.use_obs_count)
-            logger.info(f"{k}{self.kmer_out_identify}", kmer_corr)
+            logger.info("%d%s%s", k, self.kmer_out_identify, kmer_corr)
     
     def evaluate_regional_corr(self, chr_pos, win_size_list=[100000, 500000], save_valid_preds=False, save_path=None):
         cols = self.prob_names + (['sample_weight'] if self.use_obs_count else [])
@@ -494,11 +525,11 @@ class Evaluator:
         valid_pred_df.reset_index(drop=True, inplace=True)
 
         if self.calibra is None:
-            logger.info('valid_pred_df: ', valid_pred_df.head())
+            logger.info('valid_pred_df:\n%s', valid_pred_df.head())
 
         for win_size in win_size_list:
             corr_win = corr_calc_sub(valid_pred_df, win_size, self.prob_names, self.use_obs_count)
-            logger.info(self.regional_out_identify, str(win_size)+'bp', corr_win)
+            logger.info("%s %dbp %s", self.regional_out_identify, win_size, corr_win)
 
         if save_valid_preds:
             save_cols = ['chrom', 'start', 'end', 'strand', 'mut_type'] + self.prob_names
@@ -510,7 +541,7 @@ class Evaluator:
         else:
             region_size = valid_size // 10
         n_regions = valid_size // region_size
-        logger.info('n_regions:', n_regions)
+        logger.info('n_regions: %d', n_regions)
 
         score = 0
         corr_3mer = []
@@ -533,14 +564,12 @@ class Evaluator:
         for i in range(self.n_class):
             corr_list.append(region_avg[i].corr(region_avg[i + self.n_class]))
 
-        if self.calibra is None:    
-            logger.info('corr_list:', corr_list)
-            #print('corr_3mer:', corr_3mer)
-            #print('corr_5mer:', corr_5mer)
-            logger.info('regional score:', score, n_regions)
+        if self.calibra is None:
+            logger.info('corr_list: %s', corr_list)
+            logger.info('regional score: %s, n_regions: %s', score, n_regions)
         else:
-            logger.info('corr_list(after fdiri_cal)', corr_list)
-            logger.info('regional score(after fdiri_cal)', score, n_regions)
+            logger.info('corr_list (after fdiri_cal): %s', corr_list)
+            logger.info('regional score (after fdiri_cal): %s, n_regions: %s', score, n_regions)
         
         self.metrics['score'] = score
 
@@ -560,9 +589,9 @@ class NBEvaluator(Evaluator):
             r_df = pd.DataFrame(r, columns=self.r_names)
             # Var = μ + μ²/r
             var = mu + mu**2 / np.maximum(r, 1e-8)
-            logger.info("calc mu by NegBinomial: ", mu.mean(axis=0))
-            logger.info("calc r by NegBinomial: ", r.mean(axis=0))
-            logger.info("calc var by NegBinomial: ", var.mean(axis=0))
+            logger.info("calc mu by NegBinomial: %s", mu.mean(axis=0))
+            logger.info("calc r by NegBinomial: %s", r.mean(axis=0))
+            logger.info("calc var by NegBinomial: %s", var.mean(axis=0))
             var_df = pd.DataFrame(var, columns=self.var_names)
             self.data_and_prob = pd.concat([self.data_and_prob, mu_df, r_df, var_df], axis=1)
 

@@ -38,7 +38,7 @@ from MuRaL.data.dataset import dict_to_tuple_collate
 from pynvml import *
 
 from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss
-from MuRaL.evaluation.observer import TimeMinor, LossMinor
+from MuRaL.evaluation.observer import TimeMinor
 from MuRaL.training.predict import Predictor, BayesianPredictor
 
 from MuRaL.utils.config_utils import read_bnn_config, read_feature_config
@@ -385,7 +385,9 @@ def main():
     # Loss function
     is_nb_model = '_nb' in str(config.get('model_no', ''))
     is_dir_mdn_model = '_dir_mdn' in str(config.get('model_no', ''))
-    is_gamma_mdn_model = '_gamma_mdn' in str(config.get('model_no', ''))
+    is_gamma_total_dirichlet_exact_model = '_total_dirichlet_mdn_exact' in str(config.get('model_no', ''))
+    is_gamma_mdn_model = '_gamma_mdn' in str(config.get('model_no', '')) \
+        and not is_gamma_total_dirichlet_exact_model
     if is_nb_model:
         criterion = NegativeBinomialLoss(n_class=n_class, reduction='sum')
         criterion.to(device)
@@ -394,6 +396,10 @@ def main():
         from MuRaL.models.losses import DirichletMDNClassificationLoss
         criterion = DirichletMDNClassificationLoss(reduction='sum')
         print("Using DirichletMDNClassificationLoss for DirMDN model:", config.get('model_no'))
+    elif is_gamma_total_dirichlet_exact_model:
+        from MuRaL.models.losses import GammaTotalDirichletExactLoss
+        criterion = GammaTotalDirichletExactLoss(reduction='sum')
+        print("Using GammaTotalDirichletExactLoss for GammaTotalDirichlet exact model:", config.get('model_no'))
     elif is_gamma_mdn_model:
         from MuRaL.models.losses import GammaMDNClassificationLoss
         criterion = GammaMDNClassificationLoss(reduction='sum')
@@ -402,6 +408,17 @@ def main():
         criterion = torch.nn.CrossEntropyLoss(reduction='sum')
 
     # Validation
+    if is_gamma_total_dirichlet_exact_model:
+        if '_gamma_total_dirichlet_mdn_exact' not in str(config.get('model_no', '')):
+            raise ValueError(
+                f"GammaTotalDirichletExact loss requires "
+                f"(e.g. 151_gamma_total_dirichlet_mdn_exact), got model_no={config.get('model_no')}"
+            )
+        if calc_loss_strategy_name != 'SKA_local':
+            raise ValueError(
+                f"GammaTotalDirichlet model requires 'SKA_local' strategy, "
+                f"but got {calc_loss_strategy_name}"
+            )
     if is_gamma_mdn_model:
         if '_gamma_mdn' not in str(config.get('model_no', '')):
             raise ValueError(
@@ -418,8 +435,7 @@ def main():
 
     # Set prob names for mutation types
 
-    Observer = [TimeMinor(out_after_n_batch=1000), 
-                LossMinor()]
+    Observer = [TimeMinor(out_after_n_batch=1000)]
 
     if args.use_bayesian:
         if is_nb_model:
@@ -438,7 +454,8 @@ def main():
                       observer=Observer, train_strategy=calc_loss_strategy_name,
                       collect_mu_r=is_nb_model,
                       collect_evidence=is_dir_mdn_model,
-                      collect_gamma_mdn=is_gamma_mdn_model)
+                      collect_gamma_mdn=is_gamma_mdn_model,
+                      collect_gamma_total_dirichlet=is_gamma_total_dirichlet_exact_model)
 
     print('model:')
     print(model)
