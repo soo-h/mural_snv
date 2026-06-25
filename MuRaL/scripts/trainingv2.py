@@ -29,7 +29,7 @@ from MuRaL.evaluation.evaluation import *
 from MuRaL.data.preprocessing import *
 from MuRaL.data.dataset import dict_to_tuple_collate
 from MuRaL.models.custom_loss import *
-from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss, PoissonGammaMDNClassificationLoss, GammaTotalDirichletSubtypeLoss, PoissonGammaLogClassificationLoss, PoissonExactClassificationLoss, GammaTotalDirichletExactLoss
+from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss, PoissonGammaMDNClassificationLoss, GammaTotalDirichletSubtypeLoss, PoissonGammaLogClassificationLoss, PoissonExactClassificationLoss, GammaTotalDirichletExactLoss, GammaLambdaAlphaExactLoss
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
 from MuRaL.training.train import Trainer, TorchBackendManager, weights_init
 from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder, GammaLambdaRecoder
@@ -207,6 +207,13 @@ def train(config, args, checkpoint_dir=None):
                 f"GammaMDN loss requires a GammaMDN model variant "
                 f"(e.g. 151_gamma_mdn), but got model_no={args.model_no}"
             )
+    is_gamma_lambda_alpha_exact = isinstance(criterion, GammaLambdaAlphaExactLoss)
+    if is_gamma_lambda_alpha_exact:
+        if '_gamma_total_dirichlet_mdn_exact_lambda' not in str(args.model_no):
+            raise ValueError(
+                f"GammaLambdaAlphaExact loss requires "
+                f"(e.g. 151_gamma_total_dirichlet_mdn_exact_lambda), got model_no={args.model_no}"
+            )
     is_gamma_total_dirichlet_exact = isinstance(criterion, GammaTotalDirichletExactLoss)
     if is_gamma_total_dirichlet_exact:
         if '_gamma_total_dirichlet_mdn_exact' not in str(args.model_no):
@@ -221,7 +228,7 @@ def train(config, args, checkpoint_dir=None):
                 f"GammaTotalDirichlet loss requires a GammaTotalDirichlet model variant "
                 f"(e.g. 151_gamma_total_dirichlet_mdn), got model_no={args.model_no}"
             )
-    is_any_gamma_mdn = is_gamma_mdn or is_gamma_total_dirichlet or is_gamma_total_dirichlet_exact
+    is_any_gamma_mdn = is_gamma_mdn or is_gamma_total_dirichlet or is_gamma_total_dirichlet_exact or is_gamma_lambda_alpha_exact
     loss_calculator = LossCalcStrategyFactory.get_loss_strategy(calc_loss_strategy_name, avg_mut_loss_strategy=args.mix_loss)
 
     config['weight_decay'] = get_weight_decay(config['batch_size'], args.epochs, train_size, args.weight_decay_auto, config['weight_decay'])

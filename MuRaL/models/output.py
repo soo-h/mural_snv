@@ -85,6 +85,9 @@ class PredictOutput(_DictCompat):
     gamma_beta_raw: Optional[torch.Tensor] = None
     dir_alpha_raw: Optional[torch.Tensor] = None
 
+    # Gamma-Lambda-Alpha variant
+    lambda_raw: Optional[torch.Tensor] = None
+
     # GAN variant
     construct_loss: Optional[torch.Tensor] = None
 

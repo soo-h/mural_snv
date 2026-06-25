@@ -385,9 +385,12 @@ def main():
     # Loss function
     is_nb_model = '_nb' in str(config.get('model_no', ''))
     is_dir_mdn_model = '_dir_mdn' in str(config.get('model_no', ''))
-    is_gamma_total_dirichlet_exact_model = '_total_dirichlet_mdn_exact' in str(config.get('model_no', ''))
+    is_gamma_lambda_alpha_exact_model = '_total_dirichlet_mdn_exact_lambda' in str(config.get('model_no', ''))
+    is_gamma_total_dirichlet_exact_model = '_total_dirichlet_mdn_exact' in str(config.get('model_no', '')) \
+        and not is_gamma_lambda_alpha_exact_model
     is_gamma_mdn_model = '_gamma_mdn' in str(config.get('model_no', '')) \
-        and not is_gamma_total_dirichlet_exact_model
+        and not is_gamma_total_dirichlet_exact_model \
+        and not is_gamma_lambda_alpha_exact_model
     if is_nb_model:
         criterion = NegativeBinomialLoss(n_class=n_class, reduction='sum')
         criterion.to(device)
@@ -396,6 +399,10 @@ def main():
         from MuRaL.models.losses import DirichletMDNClassificationLoss
         criterion = DirichletMDNClassificationLoss(reduction='sum')
         print("Using DirichletMDNClassificationLoss for DirMDN model:", config.get('model_no'))
+    elif is_gamma_lambda_alpha_exact_model:
+        from MuRaL.models.losses import GammaLambdaAlphaExactLoss
+        criterion = GammaLambdaAlphaExactLoss(reduction='sum')
+        print("Using GammaLambdaAlphaExactLoss for GammaLambdaAlpha model:", config.get('model_no'))
     elif is_gamma_total_dirichlet_exact_model:
         from MuRaL.models.losses import GammaTotalDirichletExactLoss
         criterion = GammaTotalDirichletExactLoss(reduction='sum')
@@ -408,6 +415,17 @@ def main():
         criterion = torch.nn.CrossEntropyLoss(reduction='sum')
 
     # Validation
+    if is_gamma_lambda_alpha_exact_model:
+        if '_gamma_total_dirichlet_mdn_exact_lambda' not in str(config.get('model_no', '')):
+            raise ValueError(
+                f"GammaLambdaAlphaExact loss requires "
+                f"(e.g. 151_gamma_total_dirichlet_mdn_exact_lambda), got model_no={config.get('model_no')}"
+            )
+        if calc_loss_strategy_name != 'SKA_local':
+            raise ValueError(
+                f"GammaLambdaAlpha model requires 'SKA_local' strategy, "
+                f"but got {calc_loss_strategy_name}"
+            )
     if is_gamma_total_dirichlet_exact_model:
         if '_gamma_total_dirichlet_mdn_exact' not in str(config.get('model_no', '')):
             raise ValueError(
@@ -455,7 +473,8 @@ def main():
                       collect_mu_r=is_nb_model,
                       collect_evidence=is_dir_mdn_model,
                       collect_gamma_mdn=is_gamma_mdn_model,
-                      collect_gamma_total_dirichlet=is_gamma_total_dirichlet_exact_model)
+                      collect_gamma_total_dirichlet=is_gamma_total_dirichlet_exact_model,
+                      collect_gamma_lambda_alpha=is_gamma_lambda_alpha_exact_model)
 
     print('model:')
     print(model)
@@ -538,8 +557,8 @@ def main():
                 else:
                     print('Warning: DirMDN model did not output evidence. Skipping evidence collection.')
 
-            # collect pi_entropy for Gamma MDN models
-            if is_gamma_mdn_model:
+            # collect pi_entropy for Gamma MDN / GammaTotalDirichlet models
+            if is_gamma_mdn_model or is_gamma_total_dirichlet_exact_model or is_gamma_lambda_alpha_exact_model:
                 valid_pi_entropy = predictor.get_pi_entropy()
                 if valid_pi_entropy is not None:
                     pi_entropy_df = pd.DataFrame(
@@ -549,7 +568,7 @@ def main():
                     dfs.append(pi_entropy_df)
                     print('pi_entropy stats:', to_np(valid_pi_entropy).mean())
                 else:
-                    print('Warning: Gamma MDN model did not output pi_entropy. Skipping pi_entropy collection.')
+                    print('Warning: Gamma model did not output pi_entropy. Skipping pi_entropy collection.')
 
             # Print some data for debugging
             for i in range(1, n_class):
@@ -627,6 +646,54 @@ def main():
             print('Gamma MDN unactivated components saved to:', pred_file_raw)
         else:
             print('Warning: Gamma MDN model did not output pi_logits/alpha_raw/beta_raw.')
+
+    # Save GammaTotalDirichlet unactivated components to separate file
+    if is_gamma_total_dirichlet_exact_model:
+        valid_pi, valid_ga, valid_gb, valid_da = predictor.get_gamma_total_dirichlet_components()
+        if valid_pi is not None:
+            K = valid_ga.shape[1]
+            pi_cols = [f'pi_logits_k{i}' for i in range(K)]
+            ga_cols = [f'alpha_raw_k{i}' for i in range(K)]
+            gb_cols = [f'beta_raw_k{i}' for i in range(K)]
+            da_cols = [f'dir_alpha_raw_k{k}_c{c}' for k in range(K) for c in range(3)]
+            pi_df = pd.DataFrame(data=to_np(valid_pi), columns=pi_cols)
+            ga_df = pd.DataFrame(data=to_np(valid_ga), columns=ga_cols)
+            gb_df = pd.DataFrame(data=to_np(valid_gb), columns=gb_cols)
+            da_df = pd.DataFrame(
+                data=to_np(valid_da.reshape(valid_da.shape[0], -1)),
+                columns=da_cols
+            )
+            raw_df = pd.concat([chr_pos, pi_df, ga_df, gb_df, da_df], axis=1)
+            suffix = '_gamma_total_dirichlet_exact_unactivated.tsv.gz'
+            pred_file_raw = pred_file.split('.bed.tsv.gz')[0] + suffix
+            raw_df.to_csv(pred_file_raw, sep='\t', float_format='%.4g', index=False)
+            print('GammaTotalDirichlet unactivated components saved to:', pred_file_raw)
+        else:
+            print('Warning: GammaTotalDirichlet model did not output unactivated components.')
+
+    # Save GammaLambdaAlpha unactivated components to separate file
+    if is_gamma_lambda_alpha_exact_model:
+        valid_pi, valid_lr, valid_ar, valid_da = predictor.get_gamma_lambda_alpha_components()
+        if valid_pi is not None:
+            K = valid_lr.shape[1]
+            pi_cols = [f'pi_logits_k{i}' for i in range(K)]
+            lr_cols = [f'lambda_raw_k{i}' for i in range(K)]
+            ar_cols = [f'alpha_raw_k{i}' for i in range(K)]
+            da_cols = [f'dir_alpha_raw_k{k}_c{c}' for k in range(K) for c in range(3)]
+            pi_df = pd.DataFrame(data=to_np(valid_pi), columns=pi_cols)
+            lr_df = pd.DataFrame(data=to_np(valid_lr), columns=lr_cols)
+            ar_df = pd.DataFrame(data=to_np(valid_ar), columns=ar_cols)
+            da_df = pd.DataFrame(
+                data=to_np(valid_da.reshape(valid_da.shape[0], -1)),
+                columns=da_cols
+            )
+            raw_df = pd.concat([chr_pos, pi_df, lr_df, ar_df, da_df], axis=1)
+            suffix = '_gamma_lambda_alpha_unactivated.tsv.gz'
+            pred_file_raw = pred_file.split('.bed.tsv.gz')[0] + suffix
+            raw_df.to_csv(pred_file_raw, sep='\t', float_format='%.4g', index=False)
+            print('GammaLambdaAlpha unactivated components saved to:', pred_file_raw)
+        else:
+            print('Warning: GammaLambdaAlpha model did not output unactivated components.')
 
     #do k-mer evaluation
     if len(kmer_corr) > 0:

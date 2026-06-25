@@ -696,3 +696,69 @@ class GammaLambdaRecoder(Observer):
     def update(self, **kwargs):
         if 'valid_preds' in kwargs:
             self.recode(kwargs['valid_preds'])
+
+
+class GammaLambdaAlphaRecoder(Observer):
+    """Collect pi_entropy and raw parameters for (λ,α)-parameterized models.
+
+    - output() returns pi_entropy
+    - get_components() returns (pi_logits, lambda_raw, alpha_raw, dir_alpha_raw)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pi_entropy = None
+        self.pi_logits = None
+        self.lambda_raw = None
+        self.alpha_raw = None
+        self.dir_alpha_raw = None
+
+    def reset(self):
+        self.pi_entropy = None
+        self.pi_logits = None
+        self.lambda_raw = None
+        self.alpha_raw = None
+        self.dir_alpha_raw = None
+
+    def recode(self, preds):
+        predict_out, _ = preds if isinstance(preds, tuple) else (preds, None)
+        if 'pi_logits' not in predict_out:
+            return
+        from MuRaL.models.gamma_mdn_model import compute_mdn_uncertainty
+        with torch.no_grad():
+            uncertainty = compute_mdn_uncertainty(predict_out)
+            entropy = uncertainty['pi_entropy'].cpu()
+        self.pi_entropy = (
+            entropy if self.pi_entropy is None
+            else torch.cat([self.pi_entropy, entropy], dim=0)
+        )
+        pi = predict_out['pi_logits'].detach().cpu()
+        self.pi_logits = (
+            pi if self.pi_logits is None
+            else torch.cat([self.pi_logits, pi], dim=0)
+        )
+        lr = predict_out['lambda_raw'].detach().cpu()
+        ar = predict_out['alpha_raw'].detach().cpu()
+        da = predict_out['dir_alpha_raw'].detach().cpu()
+        self.lambda_raw = (
+            lr if self.lambda_raw is None
+            else torch.cat([self.lambda_raw, lr], dim=0)
+        )
+        self.alpha_raw = (
+            ar if self.alpha_raw is None
+            else torch.cat([self.alpha_raw, ar], dim=0)
+        )
+        self.dir_alpha_raw = (
+            da if self.dir_alpha_raw is None
+            else torch.cat([self.dir_alpha_raw, da], dim=0)
+        )
+
+    def output(self):
+        return self.pi_entropy
+
+    def get_components(self):
+        return self.pi_logits, self.lambda_raw, self.alpha_raw, self.dir_alpha_raw
+
+    def update(self, **kwargs):
+        if 'valid_preds' in kwargs:
+            self.recode(kwargs['valid_preds'])

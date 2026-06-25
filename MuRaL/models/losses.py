@@ -660,6 +660,56 @@ class GammaTotalDirichletExactLoss(nn.Module):
         return l4 + self.w_mut * lmut + self.w_type * ltype
 
 
+class GammaLambdaAlphaExactLoss(nn.Module):
+    """(λ,α)-parameterized Gamma-Total-Dirichlet exact loss.
+
+    λ is direct (not α/β), α is concentration.
+    P(0) = (α/(α+λ))^α, computed via log1p for stability.
+    """
+
+    def __init__(self, w_mut=0.2, w_type=0.2, eps=1e-8, reduction='sum'):
+        super().__init__()
+        self.w_mut = w_mut
+        self.w_type = w_type
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, out, y):
+        from MuRaL.models.gamma_mdn_model import gamma_lambda_alpha_predict_from_output
+
+        pred = gamma_lambda_alpha_predict_from_output(out, eps=self.eps)
+        prob = pred['prob']
+        subtype_mix = pred['subtype_mix']
+
+        # 1. Four-class NLL
+        log_prob = torch.log(prob + self.eps)
+        l4_per_sample = F.nll_loss(log_prob, y, reduction='none')
+        l4 = self._reduce(l4_per_sample)
+
+        # 2. Mutation BCE
+        y_mut = (y > 0).float()
+        p_mut = 1.0 - prob[:, 0]
+        lmut_per_sample = F.binary_cross_entropy(p_mut.clamp(self.eps, 1.0 - self.eps), y_mut, reduction='none')
+        lmut = self._reduce(lmut_per_sample)
+
+        # 3. Subtype CE
+        mut_mask = y > 0
+        if mut_mask.any():
+            y_type = y[mut_mask] - 1
+            subtype_prob_mut = subtype_mix[mut_mask]
+            log_subtype = torch.log(subtype_prob_mut + self.eps)
+            ltype = F.nll_loss(log_subtype, y_type, reduction=self.reduction)
+        else:
+            ltype = prob.sum() * 0.0
+
+        return l4 + self.w_mut * lmut + self.w_type * ltype
+
+    def _reduce(self, loss):
+        if self.reduction == 'mean': return loss.mean()
+        elif self.reduction == 'sum': return loss.sum()
+        return loss
+
+
 class LossFactory():
     def __init__(self) -> None:
         pass
@@ -691,6 +741,8 @@ class LossFactory():
             w_mut = model_config.get('w_mut', 0.2) if model_config else 0.2
             w_type = model_config.get('w_type', 0.2) if model_config else 0.2
             return GammaTotalDirichletExactLoss(w_mut=w_mut, w_type=w_type, reduction='sum')
+        elif loss_name == 'GammaLambdaAlphaExact':
+            return GammaLambdaAlphaExactLoss(reduction='sum')
         elif loss_name == 'GammaTotalDirichletSubtype':
             w_mut = model_config.get('w_mut', 0.2) if model_config else 0.2
             w_type = model_config.get('w_type', 0.2) if model_config else 0.2
@@ -849,6 +901,7 @@ class AdaptiveLossStrategy2():
         is_poisson_gamma_log = isinstance(criterion, PoissonGammaLogClassificationLoss)
         is_poisson_exact = isinstance(criterion, PoissonExactClassificationLoss)
         is_gamma_total_dirichlet_exact = isinstance(criterion, GammaTotalDirichletExactLoss)
+        is_gamma_lambda_alpha_exact = isinstance(criterion, GammaLambdaAlphaExactLoss)
         if is_nb_loss:
             mu = preds.get('mu')
             r = preds.get('r')
@@ -873,7 +926,7 @@ class AdaptiveLossStrategy2():
                 return (loss * sample_weight.squeeze()).sum()
             return loss
 
-        if is_dir_mdn or is_gamma_mdn or is_poisson_gamma_mdn or is_gamma_total_dirichlet or is_poisson_gamma_log or is_poisson_exact or is_gamma_total_dirichlet_exact:
+        if is_dir_mdn or is_gamma_mdn or is_poisson_gamma_mdn or is_gamma_total_dirichlet or is_poisson_gamma_log or is_poisson_exact or is_gamma_total_dirichlet_exact or is_gamma_lambda_alpha_exact:
             # MDN loss: preds dict passed directly to criterion
             loss = criterion(preds, y)
             loss_local1 = loss_local2 = loss_local3 = None

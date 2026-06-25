@@ -5,14 +5,16 @@ import time
 logger = logging.getLogger('mural')
 
 import torch.nn.functional as F
-from MuRaL.evaluation.observer import Observer, TimeMinor, GradMinor, LossMinor, PredsRecoder, MuRRecoder, SubModelPredResRecoder, ContributionMinor2, DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder
+from MuRaL.evaluation.observer import (Observer, TimeMinor, GradMinor, LossMinor,
+    PredsRecoder, MuRRecoder, SubModelPredResRecoder, ContributionMinor2,
+    DirMDNRecoder, GammaMDNRecoder, GammaTotalDirichletRecoder, GammaLambdaAlphaRecoder)
 from MuRaL.training.train import TrainerSubject, get_inputs_labels, model_train_register
 
 
 
 
 class Predictor(TrainerSubject):
-    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False, collect_gamma_total_dirichlet=False) -> None:
+    def __init__(self, model, loss_calculator, criterion, device, config, observer=None, train_strategy=None, collect_mu_r=False, collect_evidence=False, collect_gamma_mdn=False, collect_gamma_total_dirichlet=False, collect_gamma_lambda_alpha=False) -> None:
 
         super().__init__()
 
@@ -26,6 +28,7 @@ class Predictor(TrainerSubject):
         self.collect_evidence = collect_evidence
         self.collect_gamma_mdn = collect_gamma_mdn
         self.collect_gamma_total_dirichlet = collect_gamma_total_dirichlet
+        self.collect_gamma_lambda_alpha = collect_gamma_lambda_alpha
 
         if observer is None:
             self.observer = [TimeMinor(out_after_n_batch=1000)]
@@ -48,6 +51,8 @@ class Predictor(TrainerSubject):
             self._gamma_mdn_recoder = GammaMDNRecoder()
         if collect_gamma_total_dirichlet:
             self._gamma_total_dirichlet_recoder = GammaTotalDirichletRecoder()
+        if collect_gamma_lambda_alpha:
+            self._gamma_lambda_alpha_recoder = GammaLambdaAlphaRecoder()
 
 
     def predict(self, dataloader_test):
@@ -61,6 +66,8 @@ class Predictor(TrainerSubject):
             self.register_observer(self._gamma_mdn_recoder)
         if self.collect_gamma_total_dirichlet:
             self.register_observer(self._gamma_total_dirichlet_recoder)
+        if self.collect_gamma_lambda_alpha:
+            self.register_observer(self._gamma_lambda_alpha_recoder)
         self.model.eval()
         valid_step_time = time.time()
         with torch.no_grad():
@@ -89,6 +96,8 @@ class Predictor(TrainerSubject):
             self.remove_observer(self._gamma_mdn_recoder)
         if self.collect_gamma_total_dirichlet:
             self.remove_observer(self._gamma_total_dirichlet_recoder)
+        if self.collect_gamma_lambda_alpha:
+            self.remove_observer(self._gamma_lambda_alpha_recoder)
         return valid_preds
 
     def predict_each_model(self, dataloader_test):
@@ -155,11 +164,25 @@ class Predictor(TrainerSubject):
             return self._dir_mdn_recoder.get_components()
         return None, None
 
+    def get_gamma_lambda_alpha_components(self):
+        """返回 (λ,α)-模型未激活分量。
+
+        - pi_logits:    [B, K], raw
+        - lambda_raw:   [B, K], raw (需 softplus 激活)
+        - alpha_raw:    [B, K], raw (需 softplus 激活)
+        - dir_alpha_raw: [B, K, 3], raw (需 softplus 激活)
+        """
+        if hasattr(self, '_gamma_lambda_alpha_recoder'):
+            return self._gamma_lambda_alpha_recoder.get_components()
+        return None, None, None, None
+
     def get_pi_entropy(self):
         """返回收集的 pi_entropy 向量。
 
-        兼容 GammaMDNRecoder 和 GammaTotalDirichletRecoder。
+        兼容 GammaMDNRecoder、GammaTotalDirichletRecoder、GammaLambdaAlphaRecoder。
         """
+        if hasattr(self, '_gamma_lambda_alpha_recoder'):
+            return self._gamma_lambda_alpha_recoder.output()
         if hasattr(self, '_gamma_total_dirichlet_recoder'):
             return self._gamma_total_dirichlet_recoder.output()
         if hasattr(self, '_gamma_mdn_recoder'):

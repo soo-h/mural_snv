@@ -440,8 +440,9 @@ class Network3_ARG_condition_GammaTotalDirichletMDN(Network3_ARG_condition):
     Dirichlet allocates mutation probability across 3 subtypes.
     """
 
-    def __init__(self, *args, K=3, **kwargs):
+    def __init__(self, *args, K=3, use_exact_predict=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.use_exact_predict = use_exact_predict
 
         self.condition_arg_proj = self.condition_arg[:3]
         del self.condition_arg
@@ -485,7 +486,136 @@ class Network3_ARG_condition_GammaTotalDirichletMDN(Network3_ARG_condition):
         predict_out['gamma_beta_raw'] = gamma_beta_raw   # [B, K]
         predict_out['dir_alpha_raw'] = dir_alpha_raw     # [B, K, 3]
 
-        inferred = gamma_total_dirichlet_subtype_predict_from_output(predict_out)
+        # use_exact_predict=True → exact Gamma-Poisson marginal
+        if getattr(self, 'use_exact_predict', False):
+            inferred = gamma_total_dirichlet_exact_predict_from_output(predict_out)
+        else:
+            inferred = gamma_total_dirichlet_subtype_predict_from_output(predict_out)
+        predict_out['out'] = inferred['logits']
+
+        if 'local_h1' in local_outs:
+            predict_out['local_h1'] = local_outs['local_h1']
+            predict_out['local_h2'] = local_outs['local_h2']
+
+        return predict_out, None
+
+
+# ──────────────────────────────────────────────
+# Gamma-Total-Dirichlet (λ,α) parameterization
+# ──────────────────────────────────────────────
+
+class GammaLambdaAlphaHead(nn.Module):
+    """Head with direct λ (mean) and α (concentration) outputs.
+
+    Instead of gamma_alpha/gamma_beta → λ = α/β, this head outputs
+    λ and α directly, and β = α/λ is derived.
+    """
+
+    def __init__(self, in_dim, K=1, dir_dim=3, hidden_dim=64):
+        super().__init__()
+        self.K = K
+        self.dir_dim = dir_dim
+
+        self.backbone = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.pi = nn.Linear(hidden_dim, K)
+        self.lambda_mu = nn.Linear(hidden_dim, K)      # λ (mutation rate)
+        self.alpha_conc = nn.Linear(hidden_dim, K)     # α (concentration)
+        self.dir_alpha = nn.Linear(hidden_dim, K * dir_dim)
+
+    def forward(self, x):
+        h = self.backbone(x)
+        pi_logits = self.pi(h)                                       # (B, K)
+        lambda_raw = self.lambda_mu(h)                               # (B, K)
+        alpha_raw = self.alpha_conc(h)                               # (B, K)
+        dir_alpha_raw = self.dir_alpha(h).view(-1, self.K, self.dir_dim)  # (B, K, 3)
+        return pi_logits, lambda_raw, alpha_raw, dir_alpha_raw
+
+
+def gamma_lambda_alpha_predict_from_output(out, eps=1e-8):
+    """Predict with direct λ,α parameterization.
+
+    P(0) = (α/(α+λ))^α  via log1p for numerical stability.
+    """
+    pi_logits = out['pi_logits']            # (B, K)
+    lambda_raw = out['lambda_raw']          # (B, K)
+    alpha_raw = out['alpha_raw']            # (B, K)
+    dir_alpha_raw = out['dir_alpha_raw']    # (B, K, 3)
+
+    pi = F.softmax(pi_logits, dim=1)
+
+    lam = F.softplus(lambda_raw) + eps               # (B, K)
+    alpha_conc = F.softplus(alpha_raw) + eps          # (B, K)
+
+    # P(no mutation) = (α/(α+λ))^α  via log1p
+    log_p_k0 = -alpha_conc * torch.log1p(lam / (alpha_conc + eps))  # (B, K)
+    log_p_k_mut = torch.log((-torch.expm1(log_p_k0)).clamp_min(eps))
+
+    dir_alpha = F.softplus(dir_alpha_raw) + eps
+    subtype_k = dir_alpha / dir_alpha.sum(dim=-1, keepdim=True)
+    log_p_ki = log_p_k_mut.unsqueeze(-1) + torch.log(subtype_k + eps)
+
+    log_p_k = torch.cat([log_p_k0.unsqueeze(-1), log_p_ki], dim=-1)  # (B, K, 4)
+    prob = (pi.unsqueeze(-1) * torch.exp(log_p_k)).sum(dim=1)
+    subtype_mix = (pi.unsqueeze(-1) * subtype_k).sum(dim=1)
+
+    return {
+        'prob': prob,
+        'subtype_mix': subtype_mix,
+        'logits': torch.log(prob + eps),
+        'pred_class': prob.argmax(dim=-1),
+    }
+
+
+class Network3_ARG_condition_GammaLambdaAlphaMDN(Network3_ARG_condition):
+    """Model 151 with (λ,α)-parameterized Gamma-Total-Dirichlet head."""
+
+    def __init__(self, *args, K=1, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.condition_arg_proj = self.condition_arg[:3]
+        del self.condition_arg
+
+        self.mdn_head = GammaLambdaAlphaHead(in_dim=128, K=K, dir_dim=3)
+
+    def forward(self, local_input, distal_input, arg_feature):
+        local_outs = self.local_scale_model(local_input)
+        local_out = local_outs.get('local_out')
+        local_out2 = local_outs.get('local_out2')
+        local_out3 = local_outs.get('local_out3')
+
+        if self.middle_radius is not None:
+            distal_out1 = self.middle_scale_model(distal_input, self.middle_radius)
+        else:
+            distal_out1 = self.middle_scale_model(distal_input)
+
+        out_dict = self.large_scale_model(distal_input)
+        distal_out2 = out_dict.get('main_pred') if isinstance(out_dict, dict) else out_dict
+        distal_out = (distal_out1 + distal_out2) / 2
+        arg_feature = self.arg_branch(arg_feature)
+
+        predict_out = {
+            'local': local_out,
+            'local2': local_out2,
+            'local3': local_out3,
+            'mid': distal_out1,
+            'distal': distal_out2,
+        }
+
+        fusion_out = self.fusion(local_out, local_out2, local_out3, distal_out)
+        hidden_128 = self.condition_arg_proj(
+            torch.concat([fusion_out, arg_feature], dim=1)
+        )
+
+        pi_logits, lambda_raw, alpha_raw, dir_alpha_raw = self.mdn_head(hidden_128)
+        predict_out['pi_logits'] = pi_logits
+        predict_out['lambda_raw'] = lambda_raw
+        predict_out['alpha_raw'] = alpha_raw
+        predict_out['dir_alpha_raw'] = dir_alpha_raw
+
+        inferred = gamma_lambda_alpha_predict_from_output(predict_out)
         predict_out['out'] = inferred['logits']
 
         if 'local_h1' in local_outs:
