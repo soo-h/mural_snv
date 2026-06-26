@@ -27,7 +27,7 @@ from MuRaL.models.nn_models import *
 from MuRaL.models.nn_utils import *
 from MuRaL.evaluation.evaluation import *
 from MuRaL.data.preprocessing import *
-from MuRaL.data.dataset import dict_to_tuple_collate
+from MuRaL.data.dataset import FeatureBatchSpec, unwrap_batch
 from MuRaL.models.custom_loss import *
 from MuRaL.models.losses import LossFactory, LossCalcStrategyFactory, NegativeBinomialLoss, DirichletMDNClassificationLoss, GammaMDNClassificationLoss, PoissonGammaMDNClassificationLoss, GammaTotalDirichletSubtypeLoss, PoissonGammaLogClassificationLoss, PoissonExactClassificationLoss, GammaTotalDirichletExactLoss, GammaLambdaAlphaExactLoss
 from MuRaL.training.optimizer import get_weight_decay, get_optimizer, get_lr_scheduler
@@ -125,14 +125,27 @@ def train(config, args, checkpoint_dir=None):
     logger.info("train_size: %d, valid_size: %d", train_size, valid_size)
 
     # data loader
+    # Build FeatureBatchSpec from the actual features produced by FeatureFactory
+    available_features = set(dataset_train.features.keys())
+    enabled_optional = [k for k in FeatureBatchSpec.optional_key_order if k in available_features]
+    feature_spec = FeatureBatchSpec(enabled_optional_keys=enabled_optional)
+
     segment_workers = args.cpu_per_trial - 1
-    #dataloader_train = generate_data_batches_v2(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True)
-    segmentDatasetLoader_train = DataLoader(dataset_train, 1, shuffle=True, num_workers=segment_workers, pin_memory=False, collate_fn=dict_to_tuple_collate)
-    dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=use_segment_task)
-        
-    #dataloader_valid = generate_data_batches_v2(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False)
-    segmentDatasetLoader_valid = DataLoader(dataset_valid, 1, shuffle=False, num_workers=segment_workers, pin_memory=False, collate_fn=dict_to_tuple_collate)
-    dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=use_segment_task)
+    segmentDatasetLoader_train = DataLoader(dataset_train, 1, shuffle=True, num_workers=segment_workers, pin_memory=False, collate_fn=unwrap_batch)
+    dataloader_train = SiteShuffleBuffer(
+        window_iter=segmentDatasetLoader_train,
+        site_batch_size=config['batch_size'],
+        shuffle_sites=True,
+        feature_spec=feature_spec,
+    )
+
+    segmentDatasetLoader_valid = DataLoader(dataset_valid, 1, shuffle=False, num_workers=segment_workers, pin_memory=False, collate_fn=unwrap_batch)
+    dataloader_valid = SiteShuffleBuffer(
+        window_iter=segmentDatasetLoader_valid,
+        site_batch_size=config['batch_size'],
+        shuffle_sites=False,
+        feature_spec=feature_spec,
+    )
 
     # get device
     device = torch.device('cpu')
@@ -255,11 +268,12 @@ def train(config, args, checkpoint_dir=None):
         model.to(device)
         logger.info("BNN model architecture:\n%s", model)
         trainer = BayesianTrainer(model, optimizer, scheduler, loss_calculator, criterion, device, config,
-                                  observer=Observer, train_strategy=calc_loss_strategy_name)
+                                  observer=Observer, train_strategy=calc_loss_strategy_name,
+                                  spec=feature_spec)
     else:
         trainer = Trainer(model, optimizer, scheduler, loss_calculator, criterion, device, config,
                           observer=Observer, train_strategy=calc_loss_strategy_name,
-                          collect_mu_r=is_nb)
+                          collect_mu_r=is_nb, spec=feature_spec)
 
     dir_mdn_recoder = DirMDNRecoder() if is_dir_mdn else None
 
@@ -425,9 +439,6 @@ def train(config, args, checkpoint_dir=None):
             
         logger.info("Epoch %d used time: %.1f seconds", epoch, time.time() - epoch_time)
         sys.stdout.flush()
-
-        dataloader_train = generate_data_batches(segmentDatasetLoader_train, config['sampled_segments'], config['batch_size'], shuffle=True, use_segment_task=use_segment_task)
-        dataloader_valid = generate_data_batches(segmentDatasetLoader_valid, config['sampled_segments'], config['batch_size'], shuffle=False, use_segment_task=use_segment_task)
 
 
     logger.info("distal_radius: %s training finished, %d epochs total time: %.1f min", args.distal_radius, epoch + 1, (time.time() - start_time) / 60)

@@ -346,7 +346,8 @@ def generate_h5f(bed_regions, h5f_path, ref_genome, central_radius, distal_radiu
     print('Generating HDF5 file:', h5f_path)
     sys.stdout.flush()
     # recode overlap realtion ship of sample in each segment
-    seq_records = SeqIO.to_dict(SeqIO.parse(open(ref_genome, 'r'), 'fasta'))
+    with open(ref_genome, 'r') as f:
+        seq_records = SeqIO.to_dict(SeqIO.parse(f, 'fasta'))
     seq_list, batch_shape = get_distal_seqs_by_region(bed_regions, seq_records, distal_radius, central_radius)
     
     with h5py.File(h5f_path, 'w') as hf:
@@ -997,7 +998,8 @@ def prepare_dataset_np(bed_regions, ref_genome, bw_files, bw_names, bw_radii,cen
             ref_genome:  <str> path of ref genome
     """
     # Prepare local data
-    ref_genome = SeqIO.to_dict(SeqIO.parse(open(ref_genome, 'r'), 'fasta'))
+    with open(ref_genome, 'r') as f:
+        ref_genome = SeqIO.to_dict(SeqIO.parse(f, 'fasta'))
     data_local, seq_cols, categorical_features, output_feature = prepare_local_datav2(bed_regions, ref_genome, bw_files, bw_names, bw_radii, central_radius, local_radius, local_order, seq_only)
 
     # If seq_only flag was set, bigWig files will be ignored
@@ -1393,7 +1395,8 @@ def prepare_dataset_h5(bed_regions, ref_genome, bw_paths, bw_files, bw_names, bw
         process.start()
     
     # Prepare local data
-    ref_genome = SeqIO.to_dict(SeqIO.parse(open(ref_genome, 'r'), 'fasta'))
+    with open(ref_genome, 'r') as f:
+        ref_genome = SeqIO.to_dict(SeqIO.parse(f, 'fasta'))
     start_time = time.time()
     data_local, seq_cols, categorical_features, output_feature = prepare_local_data(bed_regions, ref_genome, bw_files, bw_names, bw_radii, central_radius, local_radius, local_order, seq_only)
     print(f"local preprocess used time: {time.time() -start_time}")
@@ -1503,6 +1506,126 @@ def get_sample_from_segment(distal_seq, sub_index, stand,radius):
 #########################################################################
 #                          Construct DataLoader 
 #########################################################################
+class SiteShuffleBuffer:
+    """Collect encoding windows and yield shuffled site-level training batches.
+
+    Replaces ``generate_data_batches``, ``get_seg_share_dataset``,
+    ``Create_DatasetSegment`` and the inner ``DataLoader(num_workers=0)``
+    with a single streaming iterator.
+
+    Work mode: sliding window with carry-over.
+
+    1. Pull encoding windows from *window_iter* one at a time.
+    2. Flatten each window's sites into per-feature tensors in an internal buffer.
+    3. When the buffer reaches *shuffle_buffer_size*, optionally shuffle,
+       then slice into *site_batch_size* batches and yield them.
+    4. Leftover sites (< site_batch_size) stay in the buffer (carry-over) and
+       mix with the next set of windows.
+    5. At epoch end, flush all remaining sites.
+
+    Parameters
+    ----------
+    window_iter : iterable
+        Upstream encoding window loader (e.g. ``DataLoader(batch_size=1, collate_fn=unwrap_batch)``).
+        Each item must be a dict ``{feature_name: tensor}``.
+    site_batch_size : int
+        Number of sites per training batch (default 256).
+    shuffle_buffer_size : int
+        Maximum number of sites to buffer before flushing (default 10000).
+    shuffle_sites : bool
+        Whether to shuffle sites within the buffer before batching.
+    drop_last : bool
+        Whether to drop the final incomplete batch at epoch end.
+    feature_spec : FeatureBatchSpec or None
+        Defines the feature order in the output tuple.
+    """
+
+    def __init__(self, window_iter, site_batch_size=256, shuffle_buffer_size=10000,
+                 shuffle_sites=True, drop_last=False, feature_spec=None):
+        self.window_iter = window_iter
+        self.site_batch_size = site_batch_size
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.shuffle_sites = shuffle_sites
+        self.drop_last = drop_last
+        self.feature_spec = feature_spec
+
+        self._buffer = None     # dict of per-feature tensors
+        self._n_buffered = 0
+
+    # ------------------------------------------------------------------
+    def _reset_buffer(self):
+        self._buffer = {}
+        self._n_buffered = 0
+
+    def _append_window(self, window):
+        """Append a single encoding window (dict of tensors) to the buffer."""
+        for key, tensor in window.items():
+            t = tensor.detach().cpu()
+            if key not in self._buffer:
+                self._buffer[key] = t.clone()
+            else:
+                self._buffer[key] = torch.cat([self._buffer[key], t], dim=0)
+        self._n_buffered = self._buffer[list(self._buffer.keys())[0]].shape[0]
+
+    def _feature_keys(self):
+        """Return the feature keys present in the buffer, in spec order."""
+        all_keys = self.feature_spec.get_feature_order() if self.feature_spec else list(self._buffer.keys())
+        return [k for k in all_keys if k in self._buffer]
+
+    def _flush(self, force_last=False):
+        if self._n_buffered == 0:
+            return
+
+        # --- epoch-end: dump complete batches then optionally the remainder ---
+        if force_last:
+            yield from self._flush_complete()
+            if self._n_buffered > 0 and not self.drop_last:
+                keys = self._feature_keys()
+                yield tuple(self._buffer[k] for k in keys)
+            self._reset_buffer()
+            return
+
+        # --- normal mid-epoch flush ---
+        yield from self._flush_complete()
+
+    def _flush_complete(self):
+        """Yield as many complete batches as possible from the buffer.
+
+        Remaining sites (< site_batch_size) stay in the buffer (carry-over).
+        """
+        idx = torch.randperm(self._n_buffered) if self.shuffle_sites else torch.arange(self._n_buffered)
+        n_complete = (self._n_buffered // self.site_batch_size) * self.site_batch_size
+
+        if n_complete == 0:
+            return
+
+        batch_indices = idx[:n_complete].view(-1, self.site_batch_size)
+        keys = self._feature_keys()
+        for batch_idx in batch_indices:
+            yield tuple(self._buffer[k][batch_idx] for k in keys)
+
+        # carry-over
+        remaining_idx = idx[n_complete:]
+        if len(remaining_idx) > 0:
+            for k in self._buffer:
+                self._buffer[k] = self._buffer[k][remaining_idx]
+            self._n_buffered = len(remaining_idx)
+        else:
+            self._reset_buffer()
+
+    # ------------------------------------------------------------------
+    def __iter__(self):
+        self._reset_buffer()
+        return self._generate()
+
+    def _generate(self):
+        for window in self.window_iter:
+            self._append_window(window)
+            if self._n_buffered >= self.shuffle_buffer_size:
+                yield from self._flush()
+        yield from self._flush(force_last=True)
+
+
 def generate_data_batches(segmentLoader_train, batch_segment, batch_size, shuffle=True, sample_workers=0, use_segment_task=False):
     iter_seg_share_dataset = get_seg_share_dataset(segmentLoader_train, batch_segment, use_segment_task)
     # init
@@ -1555,68 +1678,6 @@ def get_seg_share_dataset(segmentLoader, batch_segment, use_segment_task):
     if segment_saver:
         segment_dataset = DatasetLoader(segment_saver)
         yield segment_dataset
-
-
-def generate_data_batches_v2(datasetLoader, batch_segment, batch_size, shuffle=True, sample_workers=0):
-    dataloader_multi_segments = MultiSegmentDatasetIterator(datasetLoader, batch_segment, batch_size)
-    
-    drop_last = False
-    # gene batch to train
-    for dataset_multi_segments in dataloader_multi_segments:
-        merge = False
-        dataloader = DataLoader(dataset_multi_segments, batch_size, shuffle=shuffle, num_workers=sample_workers, pin_memory=False)
-        for segment_samples in dataloader:
-            sample_number = segment_samples[0].shape[0]
-            # if sample less than batch number, merge to next segment
-            if sample_number < batch_size:
-                merge = True
-                break
-
-            yield segment_samples
-        # check end and read next segment
-        try:
-            dataset_multi_segments = next(dataloader_multi_segments)
-        except StopIteration:
-            # merge=True, indicate last batch not output. 
-            if merge and not drop_last:
-                yield segment_samples
-            return
-                
-        # if merge, merge to next segment
-        if merge:
-            dataset_multi_segments.merge_batch(segment_samples)
-
-class MultiSegmentDatasetIterator:
-    def __init__(self, segment_dataset_loader, segment_number, batch_size):
-        self.segment_dataset_loader = iter(segment_dataset_loader)
-        self.segment_nember = segment_number
-        self.batch_size = batch_size
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        count = 0
-        dataset_multi_segment = None
-        while count < self.batch_size:
-            try:
-                dataset_segment = next(self.segment_dataset_loader)
-                if dataset_multi_segment is None:
-                    dataset_multi_segment = dataset_segment
-                else:
-                    dataset_multi_segment.merge_dataset(dataset_segment)
-                count += 1
-            except StopIteration:
-                if dataset_multi_segment is not None:
-                    # 返回最后一个不足 batch_size 的批次
-                    return_value = dataset_multi_segment
-                    dataset_multi_segment = None
-                    return return_value
-                else:
-                    raise StopIteration
-        return_value = dataset_multi_segment
-        dataset_multi_segment = None
-        return return_value
 
 
 # class Create_DatasetSegment(Dataset):
@@ -1813,29 +1874,6 @@ class Create_DatasetSegment_Adaptive(Dataset):
 # - sample numbers between batchs are different 
 # - sample numbers is dependend on SNP density
 ####################
-
-def generate_data_batches_filt(dataset, 
-                          batch_segment: int=1, 
-                          cutoff_batch_size: int=128, 
-                          shuffle: bool=True, 
-                          num_workers: int=0):
-    
-    dataloader = DataLoader(dataset, batch_segment, shuffle=shuffle, num_workers=num_workers, pin_memory=False)
-    batch_number = 0
-    train_number = 0
-    for y, cont_x, cat_x, distal_x in dataloader:
-        batch_number += 1
-        y = y.squeeze(0)
-        cont_x = cont_x.squeeze(0)
-        cat_x = cat_x.squeeze(0)
-        distal_x = distal_x.squeeze(0)
-            # if sample less than batch number, merge to next segment
-        if y.shape[0] < cutoff_batch_size:
-            continue
-
-        train_number += 1
-        yield y, cont_x, cat_x, distal_x
-    print(f"total {batch_number} segment, drop {batch_number-train_number} segment")
 
 def get_expanded_region(start, stop, radius, model_type='snv'):
     """

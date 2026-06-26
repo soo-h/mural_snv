@@ -31,7 +31,7 @@ class TrainerSubject:
                 self.metrics.update(indicator)
 
 class BayesianTrainer(TrainerSubject):
-    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None) -> None:
+    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, spec=None) -> None:
 
         super().__init__()
 
@@ -43,9 +43,14 @@ class BayesianTrainer(TrainerSubject):
         self.config = config
         self.LossCalculator = loss_calculator
         self.train_strategy = train_strategy
+        self.spec = spec
         self.preds_adapter = AdaptPreds(self.config['model_no'], self.train_strategy)
-        self.model_train = model_train_register(self.train_strategy)
-        self.model_predict = model_train_register(self.train_strategy)
+        if spec is not None:
+            self.model_train = model_train_register_v2(spec)
+            self.model_predict = model_train_register_v2(spec)
+        else:
+            self.model_train = model_train_register(self.train_strategy)
+            self.model_predict = model_train_register(self.train_strategy)
         self.kl_loss = self.config['kl_loss']
 
         # bayesian config
@@ -78,7 +83,10 @@ class BayesianTrainer(TrainerSubject):
             time_tmp = time.time()
 
             batch = self.load_to_device(batch, self.device)
-            label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
+            if self.spec is not None:
+                label, inputs, sample_weight = get_inputs_labels_v2(batch, self.spec, self.train_strategy)
+            else:
+                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
 
             # bayesian monte carlo
             output_ = []
@@ -131,7 +139,10 @@ class BayesianTrainer(TrainerSubject):
         with torch.no_grad():
             for batch in dataloader_valid:
                 batch = self.load_to_device(batch, self.device)
-                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
+                if self.spec is not None:
+                    label, inputs, sample_weight = get_inputs_labels_v2(batch, self.spec, self.train_strategy)
+                else:
+                    label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
 
                 pred_results = [] # used loss calc
                 output_mc = [] # used ensemble predict(mean) and uncertainty(std)
@@ -208,7 +219,7 @@ class BayesianTrainer(TrainerSubject):
             return preds
 
 class Trainer(TrainerSubject):
-    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, collect_mu_r=False) -> None:
+    def __init__(self, model, optimizer, scheduler, loss_calculator, criterion, device, config, observer=None, train_strategy=None, collect_mu_r=False, spec=None) -> None:
 
         super().__init__()
 
@@ -220,9 +231,14 @@ class Trainer(TrainerSubject):
         self.config = config
         self.LossCalculator = loss_calculator
         self.train_strategy = train_strategy
+        self.spec = spec
         self.preds_adapter = AdaptPreds(self.config['model_no'], self.train_strategy)
-        self.model_train = model_train_register(self.train_strategy)
-        self.model_predict = model_train_register(self.train_strategy)
+        if spec is not None:
+            self.model_train = model_train_register_v2(spec)
+            self.model_predict = model_train_register_v2(spec)
+        else:
+            self.model_train = model_train_register(self.train_strategy)
+            self.model_predict = model_train_register(self.train_strategy)
 
         if observer is None:
             self.observer = [TimeMinor(out_after_n_batch=1000), GradMinor(out_after_n_batch=2000), LossMinor()]
@@ -253,7 +269,10 @@ class Trainer(TrainerSubject):
             time_tmp = time.time()
 
             batch = self.load_to_device(batch, self.device)
-            label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
+            if self.spec is not None:
+                label, inputs, sample_weight = get_inputs_labels_v2(batch, self.spec, self.train_strategy)
+            else:
+                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
             preds = self.model_train(inputs, self.model)
             # adapt preds to the loss calculator
             preds = self.preds_adapter.adapt(preds)
@@ -292,10 +311,12 @@ class Trainer(TrainerSubject):
         with torch.no_grad():
             for batch in dataloader_valid:
                 batch = self.load_to_device(batch, self.device)
-                label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
+                if self.spec is not None:
+                    label, inputs, sample_weight = get_inputs_labels_v2(batch, self.spec, self.train_strategy)
+                else:
+                    label, inputs, sample_weight = get_inputs_labels(batch, self.train_strategy)
                 valid_preds = self.model_predict(inputs, self.model)
                 valid_preds = self.preds_adapter.adapt(valid_preds)
-                #label, valid_preds = model_predict(batch, self.model, self.train_strategy)
                 losses = self.LossCalculator.calc_loss(valid_preds, label, self.criterion, sample_weight)
                 #valid_pred = self.LossCalculator.extract_pred(valid_preds)
                 sample_number = batch[0].shape[0]
@@ -464,6 +485,93 @@ class TorchBackendManager:
         """Display the current PyTorch device information."""
         logger.info("torch._C._cuda_getDeviceCount(): %s", torch._C._cuda_getDeviceCount())
         logger.info("torch.cuda.device_count(): %s", torch.cuda.device_count())
+
+# ----------------------------------------------------------------
+#  FeatureBatchSpec-driven model train (replaces strategy dispatch)
+# ----------------------------------------------------------------
+
+from MuRaL.models.nn_models import Network0, Network1, Network2
+
+_LOCAL_INPUT_KEY_MAP = {
+    'segment_avg_mut': 'avg_mutations',
+    'step_avg_mut': 'avg_mutations',
+    'segment_avg_kmer_mut': 'segment_avg_kmer_mut',
+    'nuc_skew': 'nuc_skew',
+}
+
+_POSITIONAL_FEATURES = ['arg_feature']
+
+
+def model_train_v2(inputs, model, spec):
+    """Unified model call driven by FeatureBatchSpec.
+
+    Detects legacy models (Network0/1/2) that expect tuple *local_input*
+    and converts to dict for modern models automatically.
+    """
+    cont_x, cat_x, distal_x = inputs[0], inputs[1], inputs[2]
+
+    # legacy models only accept tuple (cont_data, cat_data)
+    if isinstance(model, (Network0, Network1, Network2)):
+        return model((cont_x, cat_x), distal_x)
+
+    # modern models accept dict local_input
+    local_input = dict(cont_data=cont_x, cat_data=cat_x)
+    extra_positional = []
+
+    optional_keys = [
+        k for k in spec.get_feature_order()
+        if k not in ('mut_type', 'cat_x', 'distal_x', 'sample_weight')
+    ]
+    for key, value in zip(optional_keys, inputs[3:]):
+        if key in _LOCAL_INPUT_KEY_MAP:
+            local_input[_LOCAL_INPUT_KEY_MAP[key]] = value
+        elif key in _POSITIONAL_FEATURES:
+            extra_positional.append(value)
+
+    return model(local_input, distal_x, *extra_positional)
+
+
+def model_train_register_v2(spec):
+    """Return a model_train function bound to *spec*."""
+    def _train(inputs, model):
+        return model_train_v2(inputs, model, spec)
+    return _train
+
+
+def get_inputs_labels_v2(batch, spec, strategy=None):
+    """Unpack batch via *spec*; build labels via *strategy* (kept for loss coupling).
+
+    This replaces the batch-unpacking half of ``get_inputs_labels``.
+    """
+    feature_order = spec.get_feature_order()
+    features = dict(zip(feature_order, batch))
+
+    y = features['mut_type']
+    cat_x = features['cat_x']
+    distal_x = features['distal_x']
+    sample_weight = features.get('sample_weight')
+
+    # inputs: all features the model expects, in spec order
+    inputs = [0, cat_x, distal_x]
+    for key in feature_order:
+        if key in ('mut_type', 'cat_x', 'distal_x', 'sample_weight'):
+            continue
+        if key in features:
+            inputs.append(features[key])
+
+    # labels: still driven by strategy (loss-side coupling, kept for now)
+    config = STRATEGY_CONFIGS.get(strategy) if strategy else None
+    labels = {'label': _process_label(y)}
+    if config:
+        if config.include_avg_mut_in_labels:
+            avg_key = next((k for k in ('step_avg_mut', 'segment_avg_mut') if k in features), None)
+            if avg_key is not None:
+                labels['avg_mut'] = features[avg_key]
+        if config.include_kmer_mut_in_labels and 'segment_avg_kmer_mut' in features:
+            labels['avg_kmer_mut'] = features['segment_avg_kmer_mut']
+
+    return labels, inputs, sample_weight
+
 
 class AdaptPreds:
     """Normalise any model output into ``(PredictOutput, Optional[SegmentOutput])``.

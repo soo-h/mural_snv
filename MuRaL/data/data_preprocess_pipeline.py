@@ -24,7 +24,8 @@ from MuRaL.data.preprocessing import distal_encoding_by_region, annot_encoding_b
 def prepare_dataset_npv3(segments, ref_genome, config):
 
     # Prepare local data
-    ref_genome = SeqIO.to_dict(SeqIO.parse(open(ref_genome, 'r'), 'fasta'))
+    with open(ref_genome, 'r') as f:
+        ref_genome = SeqIO.to_dict(SeqIO.parse(f, 'fasta'))
     features = FeatureFactory(segments, ref_genome, config).create_all()
 
     # Combine local data and distal into Dataset objects  
